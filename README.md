@@ -6,9 +6,8 @@ source-attributed updates to the DynaSport Facebook Page:
 ```
 cron-job.org (every 10 minutes)
   → Authorization-protected /api/football/automation
-  → shared atomic NewsData.io budget check (≤200/day UTC + rolling-24h guard, Neon-backed)
-  → NewsData.io Latest News discovery (at most one request per run)
-  → validated RSS feed discovery (zero NewsData credits; runs even when budget is exhausted)
+  → anti-flood + popularity gate (rolling hour window, NO daily cap)
+  → validated RSS feed discovery (sole source, no third-party API budget)
   → all-competition relevance + source-credibility filtering
   → duplicate detection (unique keys + cross-publisher story matching, corroboration-aware)
   → Neon PostgreSQL atomic publish claim (no double posts; failures stay retryable)
@@ -22,8 +21,7 @@ cron-job.org (every 10 minutes)
 - Next.js (App Router) — monitoring dashboard at `/`, API routes only
 - Neon PostgreSQL via `@neondatabase/serverless` (production, over HTTPS; no ORM)
 - `pg` (node-postgres) is used **only** when `DATABASE_URL` is not a Neon host, so the app can be run and debugged locally. The Neon driver itself is HTTP-only and cannot talk to a local Postgres process; a Neon URL always takes the Neon driver, so production is unaffected and uses the same SQL.
-- NewsData.io `GET /api/1/latest` — football discovery (server-side only, budget-gated)
-- Validated public football RSS feeds — fresh discovery at zero NewsData credit cost
+- Validated public football RSS/Atom feeds — the only discovery source, no API budget or request ceiling
 - Meta Graph API `v25.0` — Page text posts
 
 ## Environment variables
@@ -31,7 +29,6 @@ cron-job.org (every 10 minutes)
 | Variable | Purpose |
 | --- | --- |
 | `DATABASE_URL` | Neon PostgreSQL connection string |
-| `NEWSDATA_API_KEY` | NewsData.io API key (server-side only) |
 | `FACEBOOK_PAGE_ID` | DynaSport Facebook Page ID |
 | `FACEBOOK_PAGE_ACCESS_TOKEN` | Facebook Page access token |
 | `FACEBOOK_APP_ID` | Meta app ID (read-only `/debug_token` health check only) |
@@ -59,51 +56,41 @@ The project is a standard Next.js App Router application — Vercel detects it a
 ## cron-job.org setup
 
 - **URL**: `https://<your-domain>/api/football/automation`
-- **Schedule**: `*/10 * * * *` — every 10 minutes, **24/7** (144 scheduled runs/day, well inside the 200-request ceiling). Do not configure a time window or pause days.
+- **Schedule**: `*/2 * * * *` — every 2 minutes, **24/7** (~720 runs/day). Every minute also works; the app is safe at any frequency because of atomic claims, a single-flight lease and adaptive polling. Do not configure a time window or pause days.
 - **Request header**: `Authorization: Bearer <CRON_SECRET>`
 
 Manual runs and retries call the same endpoint with the same header, so every execution shares the same atomic request accounting.
 
-## NewsData.io request budget (200/day, hard)
+## Discovery: RSS only, no API limits
 
-NewsData.io documents the free plan as **200 API credits/day** (1 credit per request, 10 articles per credit) with a **30-credits-per-15-minutes** rate limit and a **100-character** query limit. The exact daily reset timezone is **not** publicly documented, so enforcement is intentionally dual-window:
+NewsData.io has been **removed**. RSS feeds are the sole discovery source, which removes the 200-requests-per-day API ceiling entirely — capacity now scales with the feed registry and the configured cron interval instead of a third-party quota.
 
-- A per-UTC-day counter guarded by a serialized `INSERT … ON CONFLICT` increment — concurrent executions cannot overshoot.
-- A rolling 24-hour event ledger as a strictly conservative guard: usage stays within 200 in **any** 24h span under any provider reset semantics. It can only restrict, never permit more.
-- Capacity is reserved atomically *before* each request and never refunded, so failed/retried requests are counted. Pagination is never auto-followed; at most one request per run.
-- The 8-minute schedule peaks at ~8 requests per 15 minutes — comfortably inside the plan's 30-per-15-minute rate limit.
-- Dashboard shows today's usage, remaining budget, rolling-24h usage, counter reset time, and last successful/failed fetch.
+Everything is environment-driven; nothing is hardcoded:
 
-## Coverage: 90 football-news categories
-
-The relevance engine recognises every story type a football news desk publishes, not just transfers:
-
-- **Transfers** — interest, negotiations, bids, rejected bids, fees, valuations, release and buy-back clauses, loans, loan-with-option, free agents, failed and cancelled deals, deadline day, January and summer windows.
-- **"Here We Go" and confirmations** — here-we-go announcements, official signings, medicals, personal terms, contract renewals, club statements.
-- **Player news** — injuries, comebacks, retirements, milestones, disputes with clubs or managers, suspensions, disciplinary investigations, agents.
-- **Manager and staff** — sackings, appointments, renewals, interviews, press conferences, sporting directors, tactical changes.
-- **Match coverage** — results, starting and predicted line-ups, previews, reactions, post-match interviews, player ratings, goals and assists, records.
-- **Club and finance** — ownership, takeovers, financial problems, FFP, points deductions, legal disputes, academy promotions, wonderkids, scouting.
-- **Governance and international** — FIFA, UEFA, Premier League, Champions League, World Cup, national-team selections and injuries, Ballon d'Or and awards.
-- **Culture** — dressing-room and training-ground reporting, VAR and referee controversy, derbies, rivalries, fan reaction, exclusive interviews, behind-the-scenes developments.
-
-Scoring uses ~427 signal terms across confirmed, reported and contextual registers. Rumours and confirmed deals are treated as equally publishable; the difference is preserved in the wording. Aggregation digests (gossip columns, rumour round-ups) are rejected because they bundle many publishers' claims into one post that cannot be attributed to a single source. Predicted line-ups and expert opinion are accepted; betting tips, odds and listicles are not.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CRON_INTERVAL_MINUTES` | 2 | How often cron-job.org calls the endpoint |
+| `FEED_BATCH_SIZE` | 180 | Feeds claimed per run |
+| `FEED_CONCURRENCY` | 40 | Simultaneous outbound feed requests |
+| `RUN_DEADLINE_MS` | 22000 | Hard ceiling per run (cron-job.org aborts at 30 s) |
+| `MAX_POSTS_PER_HOUR` | 4 | Anti-flood rolling-hour ceiling (NOT a daily cap) |
+| `MIN_SPACING_MINUTES` | 6 | Minimum minutes between posts |
+| `POPULARITY_MIN_SCORE` | 65 | Editorial bar a story must clear |
 
 ## News discovery
 
-- **NewsData.io**: one broad sports-category, English-language football query per run; results processed locally (no per-club/per-player queries).
 - **RSS feeds — 624 validated public feeds** (`src/lib/feeds.ts`). Every URL was verified with a real HTTP request (200 + parseable RSS/Atom + >=3 items + usable timestamps) before inclusion. Coverage spans the Premier League and EFL, Scottish/Welsh/Irish and non-league football, all major European leagues, UEFA/FIFA competitions, international and women's football, plus club-, manager- and player-specific feeds. Fetched politely (timeout-bounded, `If-None-Match`/`If-Modified-Since`, rotation, backoff) with per-feed health in Neon. **Google News RSS was deliberately excluded** — its feed body carries an express restriction to personal, non-commercial use.
-- RSS is the **primary publishing source**; NewsData.io is used for corroboration and context only, never as breaking news.
-- NewsData free-plan results can lag ~12h; stories are ranked by original publication timestamps, fresh RSS items outrank stale API items, and nothing is presented as real-time breaking news when it is not.
+- RSS is the **only** publishing source; there is no third-party API in the discovery path.
+- Stories are ranked by original publication timestamps, and nothing is presented as real-time breaking news when it is not.
 
 ## Continuous 24/7 operation
 
-DynaSport runs **every 10 minutes, around the clock** — no operating window, no overnight/weekend/holiday pause, and no dependency on a browser or manual start. Expected volume is **144 scheduled runs per 24h**, inside the 200-request NewsData.io ceiling with ample headroom for manual runs and retries.
+DynaSport runs continuously — no operating window, no overnight/weekend/holiday pause, and no dependency on a browser or manual start. The default interval is **every 2 minutes** (`CRON_INTERVAL_MINUTES`), roughly 720 runs/day, with no API budget to exhaust.
 
-- Every run independently verifies the remaining NewsData.io budget before making any request.
+- Every run checks the anti-flood window and the popularity bar before publishing.
 - When the budget is exhausted, RSS discovery and publishing continue unaffected.
 - Transient failures (provider outage, feed error, Facebook hiccup) are recorded and recovered automatically on a later run — no manual intervention.
-- Runs are bounded by a **22-second internal deadline** because cron-job.org aborts a request after 30 seconds; any work that does not fit happens on the next run. Each run polls a rotating slice of 14 feeds (least-recently-fetched first) from the 624-feed catalogue.
+- Runs are bounded by `RUN_DEADLINE_MS` (default 22 s) because cron-job.org aborts a request after 30 seconds; any work that does not fit happens on the next run. Each run claims a bounded batch of due feeds (default 180) from the 624-feed catalogue.
 - A Neon-backed **single-flight lease** stops overlapping executions from duplicating work; budget reservations and publication claims remain atomic regardless.
 - Every run, error, fetch and publishing result is recorded in Neon.
 
@@ -134,28 +121,29 @@ Selection happens upstream in the relevance, freshness, source-credibility and d
 | Posts per automation run | 1 (always sequential, never batched) |
 | Ordinary post spacing | 3 minutes (politeness only) |
 | Top stories | Bypass spacing — confirmed announcements **and** significant rumours from credible reporters |
-| NewsData.io API credits | 200/day — unchanged, an API protection limit |
 
 The 3-minute spacing exists only so Facebook has time to process each request. Two kinds of story skip it: confirmed announcements (official stage, score >=100) and **significant rumours from credible reporters** (score >=105). Rumours are treated as first-class football-news content — that is what football pages actually publish — but only credible sources can jump the queue, so aggregator blogs cannot. `next_eligible_publish_at` is persisted in Neon, so redeploys cannot reset it. A failed Facebook call returns the slot immediately.
 
-## Freshness: newly published only
+## Freshness: breaking, fresh, trending, older
 
-- A story may be published only if its **original publication timestamp** is newer than the last successful scan checkpoint, bounded by a **60-minute recovery window**.
-- Items with missing, unparseable, future-dated or untrustworthy timestamps are never published automatically.
-- NewsData.io items are **never** publishing candidates (free-plan delivery can lag ~12h); they are stored for deduplication and context.
-- Checkpoints advance only when discovery actually succeeded, so an outage cannot flood the Page with hours-old stories.
-- All timestamps are stored and compared in UTC.
+There is **no blanket age cut-off**. A story is classified, not simply discarded by age:
 
-## Rumours vs confirmed deals
+| Category | Window | Rule |
+| --- | --- | --- |
+| **Breaking** | <= 6 h | Confirmed development (agreement/official). Publish immediately after verification. |
+| **Fresh** | <= 48 h | Important development. Publishes on its own merits. |
+| **Trending** | 2-7 days | Publishes **only** when at least **2 distinct credible publishers** independently report it and the relevance score is >= 60. Always labelled trending, never described as newly breaking. |
+| **Older** | > 7 days | Rejected unless it is a materially new development with its own event fingerprint. |
 
-DynaSport reports rumours the way a football news page does: promptly, but never dressed up as fact.
+Corroboration is counted in `story_sources`, whose primary key is `(fingerprint, publisher)` — so **one outlet republishing five near-copies counts as breadth of one, not five**. No engagement or popularity numbers are invented: if there is no corroboration evidence, the story is scored on newsworthiness and freshness alone and is never claimed to be trending.
 
-- Every unconfirmed story carries a `Report:` prefix and an explicit certainty caveat tied to its detected stage (interest → talks → bid → agreement → official).
-- Confirmed announcements are stated plainly, with no hedge.
-- A story is never attributed to a reporter who did not actually write it; the named publisher of the article is used.
-- No invented fees, quotes, sources, timelines or motives — only what the original report states.
+A trending story DynaSport has already posted is **not** re-posted for remaining popular; only a materially new development (new bid, official statement, agreement) qualifies.
 
-## Post format
+### Timestamp semantics
+
+`published_at` is the publisher's original time, `first_seen_at` is when DynaSport discovered the article, `last_seen_at` is the latest feed observation, and `updated_at` is row maintenance (never a publication date). Age is always measured from `published_at`, so re-fetching an old article can never make it look newly published. Timestamp parsing handles RFC-822 named zones (`BST`), ISO-8601/Atom, bare `YYYY-MM-DD HH:MM:SS` as UTC, and bare epoch values — detecting **seconds vs milliseconds** by magnitude rather than guessing. Missing, invalid, future-dated and implausible-year timestamps are rejected explicitly instead of being treated as fresh. The dashboard shows both, e.g. *"published 5 days ago · discovered 7 minutes ago"*.
+
+## Post format## Post format
 
 ```
 🚩 <headline>
@@ -169,12 +157,12 @@ Headline and explanation come only from the publisher's own headline and summary
 
 ## Behaviour notes
 
-- Each run publishes at most one queued story — sequential by design, never a batch. Discovery always runs (RSS keeps working after the NewsData budget is exhausted), and the publishing count is never capped.
+- Each run publishes at most one queued story — sequential by design, never a batch. There is no daily cap; only burst flooding is limited.
 - Responses stay small and fast so cron-job.org never times out or deprioritizes the job.
 - Rumours are published hedged (prefixed `Report:`); only reported facts are stated plainly; attribution always uses the real publisher of the article.
 - Duplicate reports of the same event across providers are merged via headline token containment (≥4 shared meaningful tokens, ≥60% containment); corroborated stories rank higher using internal evidence only.
 - Failed Facebook posts return to the queue with exponential backoff; uncertain outcomes (timeouts) are reconciled against the Page feed before any retry to prevent duplicate posts. Items are marked published only after Meta confirms (or reconciliation finds) the post.
-- Tables (`news_items`, `stories`, `story_publications`, `request_budget`, `request_events`, `rss_feeds`, `automation_runs`, `automation_lease`, `scan_state`, `publish_state`) are created automatically on first use.
+- Tables (`news_items`, `stories`, `story_publications`, `published_posts`, `story_sources`, `rss_feeds`, `feed_batches`, `article_cache`, `queue_resets`, `automation_runs`, `automation_lease`, `scan_state`, `publish_state`) are created automatically on first use.
 
 ## Routes
 
