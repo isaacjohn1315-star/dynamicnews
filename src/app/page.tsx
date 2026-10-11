@@ -66,7 +66,7 @@ export default async function DashboardPage() {
           <>
             <section className="mt-8 grid gap-4 lg:grid-cols-3">
               <BudgetCard data={data} />
-              <KpiGrid totals={data.totals} />
+              <KpiGrid totals={data.totals} publish={data.publish} />
             </section>
 
             <section className="mt-4 grid gap-4 lg:grid-cols-5">
@@ -76,16 +76,16 @@ export default async function DashboardPage() {
 
             <section className="mt-4 grid gap-4 lg:grid-cols-5">
               <PublishedCard posts={data.recentPublished} />
-              <FeedsCard feeds={data.feeds} />
+              <FeedsCard feeds={data.feeds} summary={data.feedSummary} />
             </section>
 
             <section className="mt-4 grid gap-4 lg:grid-cols-5">
-              <ContinuousCard runsToday={data.totals.runsToday} lastRun={data.lastRun} />
+              <ContinuousCard runsToday={data.totals.runsToday} lastRun={data.lastRun} lastSuccessfulRun={data.lastSuccessfulRun} scan={data.scan} publish={data.publish} />
               <DuplicateShieldCard totals={data.totals} />
             </section>
 
             <section className="mt-4">
-              <PipelineCard lastRun={data.lastRun} feedCount={data.feeds.length} />
+              <PipelineCard lastRun={data.lastRun} feedCount={data.feedSummary.catalogue} />
             </section>
           </>
         )}
@@ -315,10 +315,10 @@ function BudgetCard({ data }: { data: DashboardData }) {
   );
 }
 
-function KpiGrid({ totals }: { totals: DashboardData["totals"] }) {
+function KpiGrid({ totals, publish }: { totals: DashboardData["totals"]; publish: DashboardData["publish"] }) {
   return (
     <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:col-span-2">
-      <Kpi icon={<Send className="h-4 w-4" />} label="Published today" value={totals.publishedToday} sub={`${formatInteger(totals.publishedTotal)} all time`} tone="lime" />
+      <Kpi icon={<Send className="h-4 w-4" />} label="Published today" value={publish.ordinaryUsed + publish.emergencyUsed} sub={`limit ${publish.totalLimit}/day · target 3-5`} tone="lime" />
       <Kpi icon={<Timer className="h-4 w-4" />} label="Publishing queue" value={totals.queue} sub={`${formatInteger(totals.awaitingRetry)} awaiting retry`} tone="sky" />
       <Kpi icon={<Copy className="h-4 w-4" />} label="Duplicates blocked" value={totals.duplicates} sub={`${formatInteger(totals.exactDuplicates)} exact · ${formatInteger(totals.storyDuplicates)} same story`} tone="violet" />
       <Kpi icon={<Funnel className="h-4 w-4" />} label="Filtered out" value={totals.rejected} sub={`${formatInteger(totals.rejectedStale)} stale · rest irrelevant`} tone="zinc" />
@@ -369,7 +369,7 @@ function RunsCard({ runs }: { runs: DashboardRun[] }) {
     <Card className="lg:col-span-2">
       <SectionLabel icon={<RefreshCw className="h-3.5 w-3.5" />}>Recent automation runs</SectionLabel>
       {runs.length === 0 ? (
-        <EmptyState text="No automation runs recorded yet. cron-job.org triggers /api/football/automation every 8 minutes." />
+        <EmptyState text="No automation runs recorded yet. cron-job.org triggers /api/football/automation every 10 minutes." />
       ) : (
         <ul className="mt-4 space-y-2">
           {runs.map((run) => (
@@ -388,7 +388,13 @@ function RunsCard({ runs }: { runs: DashboardRun[] }) {
                 <span title="New stories queued">queued <span className="text-zinc-200">{run.newCandidates + run.rssNewCandidates}</span></span>
                 <span title="Exact article duplicates">exact <span className="text-zinc-200">{run.exactDuplicates}</span></span>
                 <span title="Same-story duplicates across publishers">story <span className="text-zinc-200">{run.storyDuplicates}</span></span>
+                <span title="Rejected because not newly published">not-new <span className="text-zinc-200">{run.staleNotNew}</span></span>
                 <span title="Follow-ups accepted (materially new development)">follow <span className="text-amber-300">{run.followupsAccepted}</span></span>
+                {run.publishSkippedReason && (
+                  <span title="Why nothing was published this run" className="text-zinc-400">
+                    hold:{run.publishSkippedReason.replace(/_/g, " ")}
+                  </span>
+                )}
                 <span title="Filtered out as irrelevant">filtered <span className="text-zinc-200">{run.rejected}</span></span>
                 <span title="Feeds healthy">feeds <span className="text-zinc-200">{run.feedsOk}/{run.feedsChecked}</span></span>
                 <span title="Posts published to Facebook">posted <span className="text-lime-300">{run.published}</span></span>
@@ -457,6 +463,11 @@ function StoriesCard({ stories }: { stories: DashboardStory[] }) {
                   )}
                   {story.storyStage && story.storyStage !== "general" && (
                     <span title="Reported stage of the underlying story">· {story.storyStage}</span>
+                  )}
+                  {story.ageMinutesAtDiscovery !== null && (
+                    <span title="Age of the article when DynaSport first saw it">
+                      · {story.ageMinutesAtDiscovery}m old at discovery
+                    </span>
                   )}
                   <span>· {timeAgo(story.createdAt)}</span>
                 </p>
@@ -539,8 +550,11 @@ function PublishedCard({ posts }: { posts: DashboardStory[] }) {
             <li key={post.id} className="rounded-xl border border-lime-300/[0.08] bg-lime-300/[0.03] px-3.5 py-3">
               <p className="text-sm leading-snug text-zinc-100">
                 <span className="mr-1.5 text-lime-300">🚩</span>
-                {post.title}
+                {post.headline ?? post.title}
               </p>
+              {post.explanation && (
+                <p className="mt-1.5 text-[11px] leading-snug text-zinc-400">{post.explanation}</p>
+              )}
               <p className="mt-1.5 text-[11px] text-zinc-400">Source: {post.sourceName ?? "unknown"}</p>
               <p className="mt-1 font-mono text-[10px] tabular-nums text-zinc-600">
                 {timeAgo(post.postedAt)} · {post.fbPostId ?? ""}
@@ -556,18 +570,33 @@ function PublishedCard({ posts }: { posts: DashboardStory[] }) {
 const FEED_STATUS_STYLES: Record<string, { cls: string; label: string }> = {
   ok: { cls: "border-lime-300/25 bg-lime-300/10 text-lime-200", label: "ok" },
   not_modified: { cls: "border-zinc-400/20 bg-white/[0.04] text-zinc-300", label: "unchanged" },
+  untested: { cls: "border-white/10 bg-white/[0.03] text-zinc-500", label: "untested" },
   error: { cls: "border-red-300/25 bg-red-300/10 text-red-200", label: "error" },
   skipped_backoff: { cls: "border-amber-300/25 bg-amber-300/10 text-amber-200", label: "backoff" },
 };
 
-function FeedsCard({ feeds }: { feeds: DashboardFeed[] }) {
+function FeedsCard({ feeds, summary }: { feeds: DashboardFeed[]; summary: DashboardData["feedSummary"] }) {
   return (
     <Card className="lg:col-span-3">
       <SectionLabel icon={<Rss className="h-3.5 w-3.5" />}>News sources & feed health</SectionLabel>
       <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
-        Validated, publicly accessible RSS feeds — fetched with conditional requests and automatic backoff.
-        RSS discovery consumes zero NewsData.io credits.
+        {formatInteger(summary.catalogue)} validated public football feeds — conditional requests, rotation and
+        automatic backoff. RSS costs zero NewsData.io credits and is the primary publishing source.
       </p>
+      <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-semibold uppercase tracking-wider">
+        <span className="rounded-full border border-lime-300/25 bg-lime-300/10 px-2 py-0.5 text-lime-200">
+          {formatInteger(summary.healthy)} healthy
+        </span>
+        <span className="rounded-full border border-red-300/25 bg-red-300/10 px-2 py-0.5 text-red-200">
+          {formatInteger(summary.failing)} failing
+        </span>
+        <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-zinc-400">
+          {formatInteger(summary.untested)} untested
+        </span>
+        <span className="rounded-full border border-amber-300/25 bg-amber-300/10 px-2 py-0.5 text-amber-200">
+          {formatInteger(summary.backoff)} backoff
+        </span>
+      </div>
       {feeds.length === 0 ? (
         <EmptyState text="Feeds register automatically on the next automation run." />
       ) : (
@@ -583,7 +612,7 @@ function FeedsCard({ feeds }: { feeds: DashboardFeed[] }) {
                 <div className="min-w-0">
                   <p className="truncate text-xs font-medium text-zinc-200">{feed.name}</p>
                   <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-600" title={feed.url}>
-                    {hostOf(feed.url)} · {feed.itemsSeen} items
+                    {hostOf(feed.url)}{feed.topic ? ` · ${feed.topic}` : ""} · {feed.itemsSeen} items
                     {feed.lastFetchedAt ? ` · ${timeAgo(feed.lastFetchedAt)}` : " · not fetched yet"}
                     {feed.consecutiveFailures > 0 ? ` · ${feed.consecutiveFailures} failures` : ""}
                   </p>
@@ -620,7 +649,7 @@ function PipelineCard({ lastRun, feedCount }: { lastRun: DashboardRun | null; fe
 
       <ol className="mt-4 flex flex-wrap items-center gap-x-2 gap-y-2 text-[11px] font-medium text-zinc-400">
         {[
-          "cron-job.org · every 8 min",
+          "cron-job.org · every 10 min",
           "Bearer-protected endpoint",
           "budget check ≤ 200/day",
           "NewsData.io discovery",
@@ -643,12 +672,13 @@ function PipelineCard({ lastRun, feedCount }: { lastRun: DashboardRun | null; fe
         <div className="rounded-xl border border-white/[0.06] bg-black/30 p-4">
           <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-500">Post format (exact)</p>
           <pre className="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-300">
-            {"🚩 Real Madrid plan to sign a world-class CB next summer.\n\nSource: Fabrizio Romano"}
+            {"🚩 Report: Liverpool are interested in signing a key player, with the reported release clause rising to EUR100m.\n\nThe reported clause could make a deal expensive, but interest alone does not mean Liverpool have made an offer or reached an agreement.\n\nSource: CaughtOffside"}
           </pre>
           <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
-            One blank line before the source line. No links, no hashtags. Rumours are always prefixed with
-            &quot;Report:&quot; and never stated as confirmed fact. Attribution uses the actual publisher or
-            reporter of the discovered article.
+            Headline, one blank line, a short explanation of why it matters and what is actually known, one
+            blank line, then the real publisher. No links, no hashtags. Rumours are prefixed &quot;Report:&quot;
+            and never stated as confirmed fact. A story is rejected if no accurate explanation or trustworthy
+            attribution can be produced.
           </p>
         </div>
         <div className="rounded-xl border border-white/[0.06] bg-black/30 p-4">
@@ -660,7 +690,7 @@ function PipelineCard({ lastRun, feedCount }: { lastRun: DashboardRun | null; fe
             </div>
             <div className="flex gap-2">
               <dt className="w-16 shrink-0 text-zinc-600">Schedule</dt>
-              <dd>*/8 * * * * (every 8 minutes)</dd>
+              <dd>*/10 * * * * (every 10 minutes)</dd>
             </div>
             <div className="flex gap-2">
               <dt className="w-16 shrink-0 text-zinc-600">Header</dt>
@@ -698,20 +728,28 @@ function PipelineCard({ lastRun, feedCount }: { lastRun: DashboardRun | null; fe
 /* 24/7 operation + duplicate shield                                    */
 /* ------------------------------------------------------------------ */
 
-const EXPECTED_RUNS_PER_DAY = 180;
+const EXPECTED_RUNS_PER_DAY = 144;
 
-function ContinuousCard({ runsToday, lastRun }: { runsToday: number; lastRun: DashboardRun | null }) {
+function ContinuousCard({
+  runsToday, lastRun, lastSuccessfulRun, scan, publish,
+}: {
+  runsToday: number;
+  lastRun: DashboardRun | null;
+  lastSuccessfulRun: DashboardRun | null;
+  scan: DashboardData["scan"];
+  publish: DashboardData["publish"];
+}) {
   const elapsedMinutes = Math.floor((Date.now() - Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`)) / 60000);
-  const expectedSoFar = Math.max(1, Math.floor(elapsedMinutes / 8));
+  const expectedSoFar = Math.max(1, Math.floor(elapsedMinutes / 10));
   const coverage = Math.min(100, Math.round((runsToday / expectedSoFar) * 100));
   const minutesSinceLast = lastRun ? Math.floor((Date.now() - Date.parse(lastRun.startedAt)) / 60000) : null;
-  const healthy = minutesSinceLast !== null && minutesSinceLast <= 20;
+  const healthy = minutesSinceLast !== null && minutesSinceLast <= 25;
 
   return (
     <Card className="lg:col-span-2">
       <SectionLabel icon={<InfinityIcon className="h-3.5 w-3.5" />}>Continuous operation</SectionLabel>
       <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">
-        DynaSport runs 24/7 — every 8 minutes, all day, every day. There is no operating window, overnight
+        DynaSport runs 24/7 — every 10 minutes, all day, every day. There is no operating window, overnight
         pause, weekend pause or holiday pause, and no browser or manual start is required.
       </p>
       <dl className="mt-4 space-y-2 text-[11px]">
@@ -729,6 +767,33 @@ function ContinuousCard({ runsToday, lastRun }: { runsToday: number; lastRun: Da
           <dt className="text-zinc-500">Last run</dt>
           <dd className={`font-mono tabular-nums ${healthy ? "text-emerald-300/90" : "text-amber-300/90"}`}>
             {lastRun ? timeAgo(lastRun.startedAt) : "none yet"}
+          </dd>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <dt className="text-zinc-500">Last successful discovery</dt>
+          <dd className="font-mono tabular-nums text-zinc-300">
+            {lastSuccessfulRun ? timeAgo(lastSuccessfulRun.startedAt) : "none yet"}
+          </dd>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <dt className="text-zinc-500">Freshness checkpoint</dt>
+          <dd className="font-mono tabular-nums text-zinc-300">
+            {scan.lastSuccessfulScanAt ? timeAgo(scan.lastSuccessfulScanAt) : "not set"}
+          </dd>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <dt className="text-zinc-500">Next post allowed</dt>
+          <dd className="font-mono tabular-nums text-zinc-300">
+            {publish.nextEligibleAt && Date.parse(publish.nextEligibleAt) > Date.now()
+              ? `${formatDateTime(publish.nextEligibleAt)} UTC`
+              : "now"}
+          </dd>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <dt className="text-zinc-500">Posts used today</dt>
+          <dd className="font-mono tabular-nums text-zinc-300">
+            {publish.ordinaryUsed}/{publish.ordinaryLimit} ordinary
+            {publish.emergencyUsed > 0 ? ` +${publish.emergencyUsed} breaking` : ""}
           </dd>
         </div>
       </dl>
