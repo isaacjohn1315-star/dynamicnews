@@ -232,6 +232,56 @@ async function createSchema(): Promise<void> {
   await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS story_duplicates integer NOT NULL DEFAULT 0`;
   await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS stale_rejected integer NOT NULL DEFAULT 0`;
   await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS followups_accepted integer NOT NULL DEFAULT 0`;
+
+  /* -------------------------------------------------------------- */
+  /* Feed catalogue metadata + freshness checkpoints                 */
+  /* -------------------------------------------------------------- */
+
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS topic text`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS last_success_at timestamptz`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS latest_item_at timestamptz`;
+  // Feeds registered before this release default to "untested" until the
+  // first successful fetch in this deployment proves they work.
+  await sql`ALTER TABLE rss_feeds ALTER COLUMN last_status SET DEFAULT 'untested'`;
+  await sql`UPDATE rss_feeds SET last_status = 'untested' WHERE last_status IS NULL`;
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS rss_feeds_rotation_idx
+      ON rss_feeds (last_fetched_at ASC NULLS FIRST)
+      WHERE enabled = true
+  `;
+
+  // Article freshness: when DynaSport first saw an item, and whether it was
+  // new at the moment of discovery.
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS first_seen_at timestamptz NOT NULL DEFAULT now()`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS headline text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS explanation text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS age_minutes_at_discovery integer`;
+
+  // Single-row scan checkpoint used by the "newly published only" gate.
+  await sql`
+    CREATE TABLE IF NOT EXISTS scan_state (
+      id integer PRIMARY KEY DEFAULT 1,
+      last_scan_at timestamptz,
+      last_successful_scan_at timestamptz,
+      CONSTRAINT scan_state_single CHECK (id = 1)
+    )
+  `;
+
+  // Publishing governor: daily caps and the persistent cooldown.
+  await sql`
+    CREATE TABLE IF NOT EXISTS publish_state (
+      day text PRIMARY KEY,
+      ordinary_posts integer NOT NULL DEFAULT 0,
+      emergency_posts integer NOT NULL DEFAULT 0,
+      next_eligible_publish_at timestamptz,
+      last_published_at timestamptz,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `;
+
+  await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS stale_not_new integer NOT NULL DEFAULT 0`;
+  await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS publish_skipped_reason text`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -277,6 +327,10 @@ export interface NewsItemRow {
   is_followup: boolean;
   duplicate_kind: string | null;
   reject_kind: string | null;
+  first_seen_at: string;
+  headline: string | null;
+  explanation: string | null;
+  age_minutes_at_discovery: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -305,6 +359,8 @@ export interface AutomationRunRow {
   story_duplicates: number;
   stale_rejected: number;
   followups_accepted: number;
+  stale_not_new: number;
+  publish_skipped_reason: string | null;
   summary: unknown;
   created_at: string;
 }
@@ -328,11 +384,14 @@ export interface StoryRow {
 export interface RssFeedRow {
   id: string;
   name: string;
+  topic: string | null;
   url: string;
   enabled: boolean;
   etag: string | null;
   last_modified: string | null;
   last_fetched_at: string | null;
+  last_success_at: string | null;
+  latest_item_at: string | null;
   last_status: string | null;
   last_error: string | null;
   consecutive_failures: number;

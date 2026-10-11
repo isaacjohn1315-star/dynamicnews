@@ -1,5 +1,8 @@
 import { ensureSchema, getDb } from "./db";
 import { getBudgetStats } from "./request-budget";
+import { getPublishState, type PublishState } from "./publishing";
+import { getScanState } from "./freshness";
+import { FEED_COUNT } from "./feeds";
 
 /**
  * Read-only aggregation for the production monitoring dashboard.
@@ -27,6 +30,8 @@ export interface DashboardRun {
   storyDuplicates: number;
   staleRejected: number;
   followupsAccepted: number;
+  staleNotNew: number;
+  publishSkippedReason: string | null;
   discoveryError: string | null;
   publishError: string | null;
   error: string | null;
@@ -43,6 +48,9 @@ export interface DashboardStory {
   corroborations: number;
   isRumour: boolean;
   storyStage: string | null;
+  headline: string | null;
+  explanation: string | null;
+  ageMinutesAtDiscovery: number | null;
   isFollowup: boolean;
   duplicateKind: string | null;
   rejectKind: string | null;
@@ -59,9 +67,12 @@ export interface DashboardStory {
 export interface DashboardFeed {
   id: string;
   name: string;
+  topic: string | null;
   url: string;
   enabled: boolean;
   lastFetchedAt: string | null;
+  lastSuccessAt: string | null;
+  latestItemAt: string | null;
   lastStatus: string | null;
   lastError: string | null;
   consecutiveFailures: number;
@@ -98,7 +109,18 @@ export interface DashboardData {
     awaitingRetry: number;
     runsToday: number;
   };
+  publish: PublishState;
+  scan: { lastScanAt: string | null; lastSuccessfulScanAt: string | null };
+  feedSummary: {
+    total: number;
+    catalogue: number;
+    healthy: number;
+    failing: number;
+    untested: number;
+    backoff: number;
+  };
   lastRun: DashboardRun | null;
+  lastSuccessfulRun: DashboardRun | null;
   recentRuns: DashboardRun[];
   recentStories: DashboardStory[];
   recentPublished: DashboardStory[];
@@ -171,7 +193,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
              budget_used_today, fetched, new_candidates, rejected,
              duplicates_skipped, published, discovery_error, publish_error, error,
              feeds_checked, feeds_ok, rss_fetched, rss_new_candidates,
-             exact_duplicates, story_duplicates, stale_rejected, followups_accepted
+             exact_duplicates, story_duplicates, stale_rejected, followups_accepted,
+             stale_not_new, publish_skipped_reason
       FROM automation_runs
       ORDER BY started_at DESC
       LIMIT 12
@@ -180,8 +203,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     const storyRows = (await sql`
       SELECT id, title, source_name, provider, feed_name, status, relevance_score,
              corroborations, is_rumour, story_stage, is_followup, duplicate_kind,
-             reject_kind, decision_reason, attempts, last_error,
-             next_retry_at, created_at, published_at, posted_at, fb_post_id
+             reject_kind, decision_reason, attempts, last_error, headline, explanation,
+             age_minutes_at_discovery, next_retry_at, created_at, published_at, posted_at, fb_post_id
       FROM news_items
       ORDER BY created_at DESC
       LIMIT 18
@@ -190,8 +213,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     const publishedRows = (await sql`
       SELECT id, title, source_name, provider, feed_name, status, relevance_score,
              corroborations, is_rumour, story_stage, is_followup, duplicate_kind,
-             reject_kind, decision_reason, attempts, last_error,
-             next_retry_at, created_at, published_at, posted_at, fb_post_id
+             reject_kind, decision_reason, attempts, last_error, headline, explanation,
+             age_minutes_at_discovery, next_retry_at, created_at, published_at, posted_at, fb_post_id
       FROM news_items
       WHERE status = 'published'
       ORDER BY posted_at DESC NULLS LAST
@@ -199,10 +222,38 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     `) as Record<string, unknown>[];
 
     const feedRows = (await sql`
-      SELECT id, name, url, enabled, last_fetched_at, last_status, last_error,
-             consecutive_failures, items_seen
+      SELECT id, name, topic, url, enabled, last_fetched_at, last_success_at,
+             latest_item_at, last_status, last_error, consecutive_failures, items_seen
       FROM rss_feeds
-      ORDER BY name ASC
+      ORDER BY
+        CASE last_status WHEN 'error' THEN 0 WHEN 'untested' THEN 1 ELSE 2 END,
+        last_fetched_at DESC NULLS LAST
+      LIMIT 60
+    `) as Record<string, unknown>[];
+
+    const feedStatsRows = (await sql`
+      SELECT
+        count(*)::int AS total,
+        count(*) FILTER (WHERE last_status IN ('ok','not_modified'))::int AS healthy,
+        count(*) FILTER (WHERE last_status = 'error')::int AS failing,
+        count(*) FILTER (WHERE last_status = 'untested' OR last_status IS NULL)::int AS untested,
+        count(*) FILTER (WHERE last_status = 'skipped_backoff')::int AS backoff
+      FROM rss_feeds
+    `) as { total: number; healthy: number; failing: number; untested: number; backoff: number }[];
+
+    const publish = await getPublishState();
+    const scan = await getScanState();
+    const lastSuccessRows = (await sql`
+      SELECT id, started_at, finished_at, status, newsdata_requests,
+             budget_used_today, fetched, new_candidates, rejected,
+             duplicates_skipped, published, discovery_error, publish_error, error,
+             feeds_checked, feeds_ok, rss_fetched, rss_new_candidates,
+             exact_duplicates, story_duplicates, stale_rejected, followups_accepted,
+             stale_not_new, publish_skipped_reason
+      FROM automation_runs
+      WHERE status <> 'error' AND feeds_ok > 0
+      ORDER BY started_at DESC
+      LIMIT 1
     `) as Record<string, unknown>[];
 
     const totals = totalsRows[0] ?? {
@@ -252,7 +303,18 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         awaitingRetry: totals.awaiting_retry,
         runsToday: runCountsRows[0]?.runs_today ?? 0,
       },
+      publish,
+      scan,
+      feedSummary: {
+        total: feedStatsRows[0]?.total ?? 0,
+        catalogue: FEED_COUNT,
+        healthy: feedStatsRows[0]?.healthy ?? 0,
+        failing: feedStatsRows[0]?.failing ?? 0,
+        untested: feedStatsRows[0]?.untested ?? 0,
+        backoff: feedStatsRows[0]?.backoff ?? 0,
+      },
       lastRun: recentRuns[0] ?? null,
+      lastSuccessfulRun: lastSuccessRows[0] ? toRun(lastSuccessRows[0]) : null,
       recentRuns,
       recentStories: storyRows.map(toStory),
       recentPublished,
@@ -284,6 +346,8 @@ function toRun(row: Record<string, unknown>): DashboardRun {
     storyDuplicates: toNumber(row.story_duplicates),
     staleRejected: toNumber(row.stale_rejected),
     followupsAccepted: toNumber(row.followups_accepted),
+    staleNotNew: toNumber(row.stale_not_new),
+    publishSkippedReason: stringOrNull(row.publish_skipped_reason),
     discoveryError: stringOrNull(row.discovery_error),
     publishError: stringOrNull(row.publish_error),
     error: stringOrNull(row.error),
@@ -303,6 +367,9 @@ function toStory(row: Record<string, unknown>): DashboardStory {
     corroborations: toNumber(row.corroborations),
     isRumour: row.is_rumour === true,
     storyStage: stringOrNull(row.story_stage),
+    headline: stringOrNull(row.headline),
+    explanation: stringOrNull(row.explanation),
+    ageMinutesAtDiscovery: row.age_minutes_at_discovery === null ? null : toNumber(row.age_minutes_at_discovery),
     isFollowup: row.is_followup === true,
     duplicateKind: stringOrNull(row.duplicate_kind),
     rejectKind: stringOrNull(row.reject_kind),
@@ -323,7 +390,10 @@ function toFeed(row: Record<string, unknown>): DashboardFeed {
     name: String(row.name ?? ""),
     url: String(row.url ?? ""),
     enabled: row.enabled === true,
+    topic: stringOrNull(row.topic),
     lastFetchedAt: isoStringOrNull(row.last_fetched_at),
+    lastSuccessAt: isoStringOrNull(row.last_success_at),
+    latestItemAt: isoStringOrNull(row.latest_item_at),
     lastStatus: stringOrNull(row.last_status),
     lastError: stringOrNull(row.last_error),
     consecutiveFailures: toNumber(row.consecutive_failures),

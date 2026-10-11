@@ -18,12 +18,22 @@ import {
 } from "./relevance";
 import { DAILY_NEWSDATA_REQUEST_LIMIT, getBudgetStats } from "./request-budget";
 import { fetchRssFeeds, type RssArticle, type RssDiscoveryResult } from "./rss";
-import { buildStoryIdentity, isMaterialFollowUp, STAGE_RANK, type StoryStage } from "./story";
+import { buildExplanation, composePost } from "./compose";
+import { evaluateFreshness, getScanState, recordScan } from "./freshness";
+import {
+  claimPublishSlot,
+  getPublishState,
+  qualifiesForEmergency,
+  releasePublishSlot,
+  type SlotRefusal,
+} from "./publishing";
+import { cleanText } from "./text";
+import { buildStoryIdentity, isMaterialFollowUp, STAGE_RANK, type StoryStage, type StoryStage as Stage } from "./story";
 
 /**
- * DynaSport automation pipeline — runs 24/7, every 8 minutes, all year.
+ * DynaSport automation pipeline — runs 24/7, every 10 minutes, all year.
  *
- *   cron-job.org (every 8 minutes, around the clock)
+ *   cron-job.org (every 10 minutes, around the clock)
  *     -> protected /api/football/automation endpoint
  *     -> single-flight lease (overlapping runs exit early)
  *     -> atomic publish of the next queued story (retry-safe; uncertain
@@ -40,11 +50,12 @@ import { buildStoryIdentity, isMaterialFollowUp, STAGE_RANK, type StoryStage } f
  *
  * Every run is bounded by RUN_DEADLINE_MS because cron-job.org aborts the
  * connection after 30 seconds. Work that does not fit simply happens on
- * the next run eight minutes later — the system recovers automatically.
+ * the next run ten minutes later — the system recovers automatically.
  */
 
 const MAX_PUBLISH_ATTEMPTS = 8;
 const RUN_DEADLINE_MS = 22_000;
+const PUBLISH_DEADLINE_MS = 14_000;
 const LEASE_SECONDS = 50;
 
 interface RssRunStats {
@@ -79,14 +90,19 @@ export interface AutomationSummary {
   rejected: number;
   duplicatesSkipped: number;
   dedupe: DedupeStats;
+  notNewRejected: number;
   rss: RssRunStats;
   publish: {
     attempted: boolean;
     published: boolean;
     reconciled: boolean;
+    emergency: boolean;
     itemId: string | null;
     fbPostId: string | null;
     error: string | null;
+    skippedReason: SlotRefusal | "no_candidate" | null;
+    ordinaryUsedToday: number;
+    nextEligibleAt: string | null;
   };
   discoveryError: string | null;
   error: string | null;
@@ -116,7 +132,12 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
       followUpsAccepted: 0,
     },
     rss: { feedsChecked: 0, feedsOk: 0, fetched: 0, newCandidates: 0, rejected: 0, duplicatesSkipped: 0, errors: 0 },
-    publish: { attempted: false, published: false, reconciled: false, itemId: null, fbPostId: null, error: null },
+    notNewRejected: 0,
+    publish: {
+      attempted: false, published: false, reconciled: false, emergency: false,
+      itemId: null, fbPostId: null, error: null, skippedReason: null,
+      ordinaryUsedToday: 0, nextEligibleAt: null,
+    },
     discoveryError: null,
     error: null,
   };
@@ -141,6 +162,8 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
     return summary;
   }
 
+  const scan = await getScanState();
+
   try {
     // Stage 1 — publish the next queued story (no NewsData credit used).
     try {
@@ -161,7 +184,7 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
         } else {
           summary.newsdataRequests = 1;
           summary.fetched = fetchResult.received;
-          await ingestNewsDataArticles(fetchResult.articles, summary);
+          await ingestNewsDataArticles(fetchResult.articles, summary, scan.lastSuccessfulScanAt);
         }
       } catch (error) {
         summary.discoveryError = errorMessage(error);
@@ -178,7 +201,7 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
         summary.rss.feedsOk = rssResult.feedsOk;
         summary.rss.fetched = rssResult.fetched;
         summary.rss.errors = rssResult.outcomes.filter((o) => o.status === "error").length;
-        await ingestRssArticles(rssResult.articles, summary);
+        await ingestRssArticles(rssResult.articles, summary, scan.lastSuccessfulScanAt);
       } catch (error) {
         const message = errorMessage(error);
         summary.discoveryError = summary.discoveryError
@@ -199,10 +222,15 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
     const rssFailed =
       rssResult === null || (rssResult.feedsChecked > 0 && rssResult.feedsOk === 0 && rssResult.articles.length === 0);
     if (summary.status === "ok" && newsdataFailed && rssFailed && summary.discoveryError) {
-      // Transient: the next scheduled run (8 minutes later) retries.
+      // Transient: the next scheduled run (10 minutes later) retries.
       summary.status = "error";
       summary.error = "All discovery paths failed this run";
     }
+    // Checkpoint the scan: successful only when discovery actually worked,
+    // so an outage cannot advance the freshness window past missed stories.
+    const discoveryWorked =
+      (rssResult !== null && rssResult.feedsOk > 0) || summary.fetched > 0;
+    await recordScan(discoveryWorked);
   } finally {
     await releaseLease(lease);
   }
@@ -260,6 +288,42 @@ async function releaseLease(holder: string | null): Promise<void> {
 async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
   const sql = getDb();
 
+  // Peek at the best eligible candidate BEFORE consuming a publishing slot.
+  const peek = (await sql`
+    SELECT id, relevance_score, story_stage_rank, is_rumour
+    FROM news_items
+    WHERE status = 'candidate'
+      AND (next_retry_at IS NULL OR next_retry_at <= now())
+    ORDER BY relevance_score DESC, published_at DESC NULLS LAST, created_at ASC
+    LIMIT 1
+  `) as { id: string; relevance_score: number; story_stage_rank: number; is_rumour: boolean }[];
+
+  const state = await getPublishState();
+  summary.publish.ordinaryUsedToday = state.ordinaryUsed;
+  summary.publish.nextEligibleAt = state.nextEligibleAt;
+
+  if (peek.length === 0) {
+    summary.publish.skippedReason = "no_candidate";
+    return;
+  }
+
+  // Only a confirmed, exceptional story may use the emergency allowance.
+  const emergency = qualifiesForEmergency(
+    peek[0].relevance_score,
+    peek[0].story_stage_rank ?? 0,
+    peek[0].is_rumour,
+  );
+
+  const slot = await claimPublishSlot(emergency);
+  summary.publish.ordinaryUsedToday = slot.ordinaryUsed;
+  summary.publish.nextEligibleAt = slot.nextEligibleAt;
+  if (!slot.granted) {
+    // Caps/cooldown reached: keep discovering, publish nothing this run.
+    summary.publish.skippedReason = slot.reason;
+    return;
+  }
+  summary.publish.emergency = emergency;
+
   // Atomically claim exactly one candidate article.
   const claimed = (await sql`
     UPDATE news_items
@@ -272,7 +336,7 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
       WHERE status = 'candidate'
         AND (next_retry_at IS NULL OR next_retry_at <= now())
       ORDER BY relevance_score DESC,
-               published_at ASC NULLS LAST,
+               published_at DESC NULLS LAST,
                created_at ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
@@ -285,7 +349,11 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
     | "story_fingerprint" | "story_stage" | "story_stage_rank" | "is_followup"
   >[];
 
-  if (claimed.length === 0) return; // nothing queued right now
+  if (claimed.length === 0) {
+    await releasePublishSlot(emergency);
+    summary.publish.skippedReason = "no_candidate";
+    return;
+  }
 
   const item = claimed[0];
   summary.publish.attempted = true;
@@ -293,12 +361,12 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
 
   if (!item.post_text || !isValidPostText(item.post_text)) {
     await releaseClaim(item.id, item.attempts, "Stored post text failed DynaSport format validation");
+    await releasePublishSlot(emergency);
     summary.publish.error = "Stored post text failed format validation; item rescheduled";
     return;
   }
 
-  // Layer C — database enforcement. One post per (story, stage), enforced
-  // by a primary key, so concurrent runs cannot publish the same story.
+  // Layer C - database enforcement. One post per (story, stage).
   const fingerprint = item.story_fingerprint;
   const stageRank = item.story_stage_rank ?? 0;
   if (fingerprint) {
@@ -319,6 +387,7 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
             updated_at = now()
         WHERE id = ${item.id}
       `;
+      await releasePublishSlot(emergency);
       summary.duplicatesSkipped += 1;
       summary.dedupe.storyDuplicates += 1;
       return;
@@ -331,8 +400,6 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
     summary.publish.published = true;
     summary.publish.fbPostId = result.id;
   } catch (error) {
-    // Uncertain outcome: the post may have reached the Page. Reconcile
-    // against the live feed before retrying, to avoid a duplicate post.
     const uncertain = error instanceof FacebookPublishError ? error.uncertain : true;
     if (uncertain) {
       const found = await findRecentMatchingPost(item.post_text);
@@ -345,20 +412,18 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
       }
     }
     const message = errorMessage(error);
-    // Release the story claim so the item stays genuinely retryable.
     if (fingerprint) {
       try {
         await sql`
           DELETE FROM story_publications
-          WHERE fingerprint = ${fingerprint}
-            AND stage_rank = ${stageRank}
-            AND published_at IS NULL
+          WHERE fingerprint = ${fingerprint} AND stage_rank = ${stageRank} AND published_at IS NULL
         `;
       } catch {
         // Claim expires with the item; retry logic still applies.
       }
     }
     await releaseClaim(item.id, item.attempts, message);
+    await releasePublishSlot(emergency);
     summary.publish.error = message;
   }
 }
@@ -441,7 +506,7 @@ interface IngestCounters {
   duplicatesSkipped: number;
 }
 
-async function ingestNewsDataArticles(articles: NewsDataArticle[], summary: AutomationSummary): Promise<void> {
+async function ingestNewsDataArticles(articles: NewsDataArticle[], summary: AutomationSummary, lastScanAt: string | null): Promise<void> {
   const inputs: (NormalizedArticle & { articleId: string })[] = [];
   for (const raw of articles) {
     const normalized = normalizeNewsDataArticle(raw);
@@ -452,13 +517,13 @@ async function ingestNewsDataArticles(articles: NewsDataArticle[], summary: Auto
     }
     inputs.push(normalized);
   }
-  const counters = await ingestNormalized(inputs, "newsdata", null, summary);
+  const counters = await ingestNormalized(inputs, "newsdata", null, summary, lastScanAt);
   summary.newCandidates += counters.newCandidates;
   summary.rejected += counters.rejected;
   summary.duplicatesSkipped += counters.duplicatesSkipped;
 }
 
-async function ingestRssArticles(articles: RssArticle[], summary: AutomationSummary): Promise<void> {
+async function ingestRssArticles(articles: RssArticle[], summary: AutomationSummary, lastScanAt: string | null): Promise<void> {
   const inputs: (NormalizedArticle & { articleId: string })[] = [];
   const feedByDedupeKey = new Map<string, string>();
   for (const raw of articles) {
@@ -473,9 +538,10 @@ async function ingestRssArticles(articles: RssArticle[], summary: AutomationSumm
       publishedAt: raw.publishedAt,
       language: "en",
       categories: ["sports"],
+      fromFootballFeed: true,
     });
   }
-  const counters = await ingestNormalized(inputs, "rss", feedByDedupeKey, summary);
+  const counters = await ingestNormalized(inputs, "rss", feedByDedupeKey, summary, lastScanAt);
   summary.rss.newCandidates += counters.newCandidates;
   summary.rss.rejected += counters.rejected;
   summary.rss.duplicatesSkipped += counters.duplicatesSkipped;
@@ -492,6 +558,7 @@ async function ingestNormalized(
   provider: "newsdata" | "rss",
   feedByDedupeKey: Map<string, string> | null,
   summary: AutomationSummary,
+  lastScanAt: string | null,
 ): Promise<IngestCounters> {
   const counters: IngestCounters = { newCandidates: 0, rejected: 0, duplicatesSkipped: 0 };
   if (inputs.length === 0) return counters;
@@ -568,12 +635,35 @@ async function ingestNormalized(
       }
     }
 
-    const postText =
-      status === "candidate" && decision.statement && sourceName
-        ? buildFacebookPostText(decision.statement, sourceName)
-        : null;
+    // --- Freshness gate: only genuinely NEW stories may be published ---
+    const freshness = evaluateFreshness(article.publishedAt, provider, lastScanAt);
+    if (status === "candidate" && !freshness.publishable) {
+      status = "rejected";
+      reason = freshness.reason;
+      summary.notNewRejected += 1;
+    }
 
-    if (status === "candidate" && !postText) {
+    // --- Compose headline + explanation ---
+    let postText: string | null = null;
+    let headline: string | null = null;
+    let explanation: string | null = null;
+    if (status === "candidate" && decision.statement && sourceName) {
+      const body = buildExplanation(
+        article.description,
+        decision.statement,
+        identity.stage,
+        decision.isRumour,
+      );
+      const composed = body ? composePost(decision.statement, body, sourceName) : null;
+      if (composed) {
+        postText = composed.message;
+        headline = composed.headline;
+        explanation = composed.explanation;
+      } else {
+        status = "rejected";
+        reason = "no accurate, useful explanation could be produced from the source report";
+      }
+    } else if (status === "candidate") {
       status = "rejected";
       reason = "no trustworthy source attribution for a publishable statement";
     }
@@ -587,7 +677,7 @@ async function ingestNormalized(
         relevance_score, is_rumour, post_text, status, decision_reason,
         provider, feed_name,
         story_fingerprint, story_stage, story_stage_rank, is_followup,
-        duplicate_kind, reject_kind
+        duplicate_kind, reject_kind, headline, explanation, age_minutes_at_discovery
       )
       VALUES (
         ${article.articleId}, ${article.title}, ${JSON.stringify(decision.titleTokens)}::jsonb,
@@ -596,7 +686,8 @@ async function ingestNormalized(
         ${decision.score}, ${decision.isRumour}, ${postText}, ${status}, ${reason},
         ${provider}, ${feedName},
         ${fingerprint}, ${identity.stage}, ${identity.stageRank}, ${isFollowUp},
-        ${duplicateKind}, ${decision.rejectKind}
+        ${duplicateKind}, ${decision.rejectKind}, ${headline}, ${explanation},
+        ${freshness.ageMinutes}
       )
       ON CONFLICT (dedupe_key) DO NOTHING
       RETURNING id
@@ -666,7 +757,7 @@ async function upsertStory(
 }
 
 function normalizeNewsDataArticle(raw: NewsDataArticle): (NormalizedArticle & { articleId: string }) | null {
-  const title = typeof raw.title === "string" ? raw.title.trim() : "";
+  const title = cleanText(raw.title);
   if (!title) return null;
 
   const dedupeKey = buildDedupeKey(raw);
@@ -675,10 +766,7 @@ function normalizeNewsDataArticle(raw: NewsDataArticle): (NormalizedArticle & { 
   return {
     articleId: dedupeKey,
     title,
-    description:
-      typeof raw.description === "string" && raw.description.trim().length > 0
-        ? raw.description.trim()
-        : null,
+    description: cleanText(raw.description) || null,
     articleUrl: typeof raw.link === "string" && raw.link.trim().length > 0 ? raw.link.trim() : null,
     sourceName: normalizeSourceName(raw),
     sourceId:
@@ -705,7 +793,8 @@ async function recordRun(summary: AutomationSummary): Promise<void> {
         rejected, duplicates_skipped, published, discovery_error,
         publish_error, error, summary,
         feeds_checked, feeds_ok, rss_fetched, rss_new_candidates,
-        exact_duplicates, story_duplicates, stale_rejected, followups_accepted
+        exact_duplicates, story_duplicates, stale_rejected, followups_accepted,
+        stale_not_new, publish_skipped_reason
       )
       VALUES (
         ${summary.trigger}, ${summary.startedAt}, ${summary.finishedAt}, ${summary.status},
@@ -716,7 +805,8 @@ async function recordRun(summary: AutomationSummary): Promise<void> {
         ${summary.rss.feedsChecked}, ${summary.rss.feedsOk}, ${summary.rss.fetched},
         ${summary.rss.newCandidates},
         ${summary.dedupe.exactDuplicates}, ${summary.dedupe.storyDuplicates},
-        ${summary.dedupe.staleRejected}, ${summary.dedupe.followUpsAccepted}
+        ${summary.dedupe.staleRejected}, ${summary.dedupe.followUpsAccepted},
+        ${summary.notNewRejected}, ${summary.publish.skippedReason}
       )
     `;
   } catch {

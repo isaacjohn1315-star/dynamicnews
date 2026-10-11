@@ -1,3 +1,5 @@
+import { cleanText } from "./text";
+
 /**
  * DynaSport relevance engine.
  *
@@ -28,6 +30,12 @@ export interface NormalizedArticle {
   publishedAt: Date | null;
   language: string | null;
   categories: string[];
+  /**
+   * True when the article came from a football-specific feed. Such items
+   * are football coverage by provenance, so the keyword gate must not
+   * reject them for lacking an explicit football word.
+   */
+  fromFootballFeed?: boolean;
 }
 
 export type SourceCredibility = "top" | "mainstream" | "tabloid" | "unknown";
@@ -73,6 +81,45 @@ const OTHER_SPORT_TERMS = [
   "ryder cup", "darts", "snooker", "volleyball", "handball", "badminton", "table tennis",
   "cycling", "tour de france", "rowing", "sailing", "wrestling", "wwe", "kabaddi",
   "pickleball", "softball", "lacrosse",
+];
+
+/**
+ * Football entities: clubs, competitions and national teams. A headline
+ * naming any of these is football coverage even when it never uses the
+ * word "football" (e.g. "Arteta confirms Saka setback"). This list exists
+ * to RECOGNISE football, never to restrict coverage to these teams —
+ * anything arriving from a football feed is treated as football too.
+ */
+const FOOTBALL_ENTITIES = [
+  "arsenal", "chelsea", "liverpool", "man utd", "man united", "manchester united",
+  "man city", "manchester city", "tottenham", "spurs", "newcastle", "aston villa",
+  "west ham", "brighton", "everton", "forest", "brentford", "crystal palace", "fulham",
+  "wolves", "bournemouth", "leicester", "southampton", "ipswich", "leeds", "burnley",
+  "sunderland", "sheffield united", "sheffield wednesday", "norwich", "watford",
+  "middlesbrough", "stoke", "coventry", "hull city", "preston", "bristol city",
+  "cardiff", "swansea", "millwall", "qpr", "blackburn", "derby county", "portsmouth",
+  "plymouth", "luton", "birmingham city", "wrexham", "oxford united", "barnsley",
+  "bolton", "wigan", "blackpool", "charlton", "rotherham", "peterborough", "reading",
+  "celtic", "rangers", "aberdeen", "hearts", "hibernian", "kilmarnock", "motherwell",
+  "dundee", "st mirren", "ross county", "real madrid", "barcelona", "barca",
+  "atletico", "sevilla", "valencia", "villarreal", "real sociedad", "athletic club",
+  "real betis", "girona", "juventus", "juve", "inter", "ac milan", "milan", "napoli",
+  "roma", "lazio", "atalanta", "fiorentina", "bologna", "bayern", "dortmund",
+  "leipzig", "leverkusen", "frankfurt", "stuttgart", "schalke", "psg",
+  "paris saint-germain", "marseille", "lyon", "monaco", "lille", "ajax", "psv",
+  "feyenoord", "porto", "benfica", "sporting", "galatasaray", "fenerbahce",
+  "besiktas", "shakhtar", "salzburg", "club brugge", "anderlecht", "olympiacos",
+  "flamengo", "palmeiras", "boca", "river plate", "inter miami", "al hilal",
+  "al nassr", "al ittihad", "premier league", "efl", "championship", "league one",
+  "league two", "national league", "scottish premiership", "la liga", "serie a",
+  "bundesliga", "ligue 1", "eredivisie", "primeira liga", "mls", "saudi pro league",
+  "champions league", "europa league", "conference league", "fa cup", "carabao cup",
+  "efl cup", "copa del rey", "coppa italia", "dfb-pokal", "club world cup",
+  "world cup", "euros", "euro 2028", "nations league", "copa america", "afcon",
+  "africa cup of nations", "asian cup", "gold cup", "copa libertadores", "fifa",
+  "uefa", "concacaf", "conmebol", "caf", "three lions", "lionesses", "socceroos",
+  "super eagles", "bafana", "selecao", "la roja", "azzurri", "les bleus",
+  "wsl", "women's super league", "nwsl", "ballon d'or",
 ];
 
 /** High-significance developments (confirmed / breaking / structural). */
@@ -206,8 +253,8 @@ export function evaluateArticle(
   article: NormalizedArticle,
   now: Date = new Date(),
 ): RelevanceDecision {
-  const title = typeof article.title === "string" ? article.title.trim() : "";
-  const description = typeof article.description === "string" ? article.description : "";
+  const title = cleanText(article.title);
+  const description = cleanText(article.description);
   const haystack = `${title} ${description}`.toLowerCase();
   const titleLower = title.toLowerCase();
   const titleTokens = tokenizeTitle(title);
@@ -227,7 +274,12 @@ export function evaluateArticle(
   if (title.length < 20) return reject("headline too short to verify");
   if (title.length > 190) return reject("headline too long for a concise post");
   if (title.endsWith("...") || title.endsWith("…")) return reject("truncated headline");
-  if (/\?\s*$/.test(title)) return reject("question headline (speculative/engagement bait)");
+  // Only obvious engagement bait is rejected. A legitimate news headline
+  // that happens to end in a question mark (common in analysis pieces) is
+  // judged on its content like any other story.
+  if (/\?\s*$/.test(title) && /\b(will|could|should|can|is|are|who|what|why|which|do|does)\b/i.test(title.slice(0, 30))) {
+    return reject("speculative question headline (engagement bait)");
+  }
   if (article.language && article.language !== "en") return reject("non-English article");
 
   const sourceName = normalizeSourceName({
@@ -241,18 +293,30 @@ export function evaluateArticle(
   }
 
   // --- Football gate -------------------------------------------------
-  const footballHits = countHits(haystack, FOOTBALL_TERMS);
+  // Football is recognised three ways: explicit vocabulary, named football
+  // entities (clubs/competitions/national teams), and feed provenance.
+  // This removes the false "not association-football news" rejections that
+  // previously discarded valid injury, quote and club stories.
+  const footballTermHits = countHits(haystack, FOOTBALL_TERMS);
+  const entityHits = countHits(haystack, FOOTBALL_ENTITIES);
+  const fromFootballFeed = article.fromFootballFeed === true;
+  const footballHits = footballTermHits + entityHits + (fromFootballFeed ? 1 : 0);
   const otherSportHits = countHits(haystack, OTHER_SPORT_TERMS);
-  const inSportsCategory =
-    article.categories.length === 0 ||
-    article.categories.some((c) => typeof c === "string" && c.toLowerCase() === "sports");
 
   if (footballHits === 0) {
-    return reject("not association-football news");
+    return reject("no football subject, entity or football-feed provenance");
   }
-  if (otherSportHits > 0 && footballHits <= otherSportHits) {
+  // Another sport only wins when it clearly dominates the article.
+  if (otherSportHits > 0 && footballTermHits + entityHits === 0) {
     return reject("primarily about another sport");
   }
+  if (otherSportHits >= 2 && otherSportHits > footballTermHits + entityHits) {
+    return reject("primarily about another sport");
+  }
+  const inSportsCategory =
+    fromFootballFeed ||
+    article.categories.length === 0 ||
+    article.categories.some((c) => typeof c === "string" && c.toLowerCase() === "sports");
   if (!inSportsCategory) {
     return reject("outside the sports category");
   }
@@ -281,6 +345,11 @@ export function evaluateArticle(
   else if (ageHours <= 24) score += 12;
   else if (ageHours <= 36) score += 6;
   else score += 2;
+
+  // Subject breadth: naming real football entities is evidence of a
+  // concrete story rather than a generic page.
+  score += Math.min(entityHits * 5, 15);
+  if (fromFootballFeed) score += 6;
 
   const highHits = countHits(haystack, HIGH_SIGNAL);
   const mediumHits = countHits(haystack, MEDIUM_SIGNAL);

@@ -14,32 +14,45 @@ import { facebookAppCredentials, facebookPageAccessToken, facebookPageId } from 
 const GRAPH_API_BASE = "https://graph.facebook.com/v25.0";
 const REQUEST_TIMEOUT_MS = 10_000;
 
-const POST_PATTERN = /^🚩 [^\n]{10,}\n\nSource: [^\n]{1,100}$/;
-const FORBIDDEN_IN_POST = /(https?:\/\/|www\.|#|\s@\w)/i;
-
 /**
  * The DynaSport post format is exact and intentional:
  *
- *   🚩 Real Madrid plan to sign a world-class CB next summer.
+ *   🚩 <headline>
  *   <blank line>
- *   Source: Fabrizio Romano
+ *   <explanation of why it matters / what is actually known>
+ *   <blank line>
+ *   Source: <real publisher>
  *
- * No article links. No hashtags. Exactly one blank line before "Source:".
+ * No article links. No hashtags. Exactly one blank line between each part.
  */
-export function buildFacebookPostText(statement: string, sourceName: string): string {
-  const cleanStatement = statement.replace(/\s+/g, " ").trim();
+const POST_PATTERN = /^🚩 [^\n]{15,}\n\n[^\n]{25,}\n\nSource: [^\n]{1,80}$/;
+const FORBIDDEN_IN_POST = /(https?:\/\/|www\.|#\w)/i;
+/** Raw markup or escaped character codes must never reach Facebook. */
+const RESIDUAL_MARKUP = /<[a-zA-Z/][^>]*>|&[a-zA-Z]{2,8};|&#\d{2,6};?/;
+
+export function buildFacebookPostText(
+  headline: string,
+  explanation: string,
+  sourceName: string,
+): string {
+  const cleanHeadline = headline.replace(/\s+/g, " ").trim();
+  const cleanExplanation = explanation.replace(/\s+/g, " ").trim();
   const cleanSource = sourceName.replace(/\s+/g, " ").trim();
-  return `🚩 ${cleanStatement}\n\nSource: ${cleanSource}`;
+  return `🚩 ${cleanHeadline}\n\n${cleanExplanation}\n\nSource: ${cleanSource}`;
 }
 
-/** Verifies format invariants before anything is sent to Meta. */
+/** Verifies every format invariant before anything is sent to Meta. */
 export function isValidPostText(text: string): boolean {
   if (!POST_PATTERN.test(text)) return false;
-  if (FORBIDDEN_IN_POST.test(text.replace("🚩 ", ""))) return false;
+  if (FORBIDDEN_IN_POST.test(text)) return false;
+  if (RESIDUAL_MARKUP.test(text)) return false;
+
   const parts = text.split("\n");
-  if (parts.length !== 3 || parts[1] !== "") return false;
+  if (parts.length !== 5) return false;
+  if (parts[1] !== "" || parts[3] !== "") return false;
   if (!parts[0].startsWith("🚩 ")) return false;
-  if (!parts[2].startsWith("Source: ") || parts[2].length <= "Source: ".length) return false;
+  if (!parts[2] || parts[2].trim().length < 25) return false;
+  if (!parts[4].startsWith("Source: ") || parts[4].length <= "Source: ".length) return false;
   return true;
 }
 

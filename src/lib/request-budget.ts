@@ -3,9 +3,9 @@ import { ensureSchema, getDb, type RequestBudgetRow } from "./db";
 /**
  * Hard, application-enforced cap on outgoing NewsData.io requests.
  *
- * cron-job.org is configured for an 8-minute interval (up to 180 scheduled
- * runs per 24h at one request per run), leaving a nominal 20-request buffer
- * for manual runs and retries. Every execution path — scheduled, manual, or
+ * cron-job.org is configured for a 10-minute interval (144 scheduled runs
+ * per 24h at one request per run), leaving a 56-request headroom for
+ * manual runs and retries inside the 200/day ceiling. Every execution path — scheduled, manual, or
  * retried — reserves capacity through the same Neon-backed accounting BEFORE
  * any request leaves this application.
  *
@@ -21,7 +21,7 @@ import { ensureSchema, getDb, type RequestBudgetRow } from "./db";
  *     It can only make the gate more conservative, never more permissive.
  *
  * The free plan's 30-credits-per-15-minutes rate limit is also respected
- * by design: an 8-minute schedule consumes at most ~8 requests per 15 min,
+ * by design: a 10-minute schedule consumes at most ~2 requests per 15 min,
  * and query strings stay well under the plan's 100-character limit.
  *
  * Both checks happen inside ONE statement together with the event insert,
