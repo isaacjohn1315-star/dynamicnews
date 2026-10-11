@@ -1,4 +1,4 @@
-import { getDb } from "@/lib/db";
+import { dbTransport, getDb } from "@/lib/db";
 
 /**
  * Liveness + readiness probe.
@@ -27,7 +27,10 @@ export async function GET(): Promise<Response> {
     service: "dynasport",
     time: new Date().toISOString(),
     database: {
-      driver: "neon",
+      // "neon-https" in production; "postgres-tcp" only when DATABASE_URL
+      // points at a non-Neon host (local development).
+      driver: dbTransport(),
+      neon: dbTransport() === "neon-https",
       configured: databaseConfigured,
       status: database,
     },
