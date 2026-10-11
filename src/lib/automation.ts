@@ -57,7 +57,8 @@ import { buildStoryIdentity, isMaterialFollowUp, STAGE_RANK, type StoryStage, ty
 
 const MAX_PUBLISH_ATTEMPTS = 8;
 const RUN_DEADLINE_MS = 22_000;
-const PUBLISH_DEADLINE_MS = 14_000;
+/** Reserved time for the publish step after discovery. */
+const PUBLISH_RESERVE_MS = 8_000;
 const LEASE_SECONDS = 50;
 
 interface RssRunStats {
@@ -168,14 +169,27 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
   const scan = await getScanState();
 
   try {
-    // Stage 1 — publish the next queued story (no NewsData credit used).
-    try {
-      await publishNextCandidate(summary);
-    } catch (error) {
-      summary.publish.error = errorMessage(error);
+    // Stage 1 — RSS discovery. Runs before publishing so that a story
+    // discovered in this run can be published in the same run instead of
+    // waiting ~10 minutes for the next one, which matters for a news page.
+    let rssResult: RssDiscoveryResult | null = null;
+    if (Date.now() < deadline) {
+      try {
+        rssResult = await fetchRssFeeds(deadline);
+        summary.rss.feedsChecked = rssResult.feedsChecked;
+        summary.rss.feedsOk = rssResult.feedsOk;
+        summary.rss.fetched = rssResult.fetched;
+        summary.rss.errors = rssResult.outcomes.filter((o) => o.status === "error").length;
+        await ingestRssArticles(rssResult.articles, summary, scan.lastSuccessfulScanAt);
+      } catch (error) {
+        const message = errorMessage(error);
+        summary.discoveryError = summary.discoveryError
+          ? `${summary.discoveryError}; RSS: ${message}`
+          : `RSS: ${message}`;
+      }
     }
 
-    // Stage 2 — NewsData.io discovery inside the shared daily budget.
+    // Stage 2 — NewsData.io corroboration inside the shared daily budget.
     if (Date.now() < deadline) {
       try {
         const fetchResult = await fetchLatestFootballNews();
@@ -194,22 +208,15 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
       }
     }
 
-    // Stage 3 — RSS discovery. Always attempted: it costs no NewsData
-    // credit, so coverage continues after the daily budget is exhausted.
-    let rssResult: RssDiscoveryResult | null = null;
-    if (Date.now() < deadline) {
+    // Stage 3 — publish the best eligible story discovered above. Publishing
+    // is fast, but it is still deadline-guarded so a slow discovery phase can
+    // never stop the run from finishing cleanly (the story simply goes out on
+    // the next run).
+    if (Date.now() < deadline + PUBLISH_RESERVE_MS) {
       try {
-        rssResult = await fetchRssFeeds(deadline);
-        summary.rss.feedsChecked = rssResult.feedsChecked;
-        summary.rss.feedsOk = rssResult.feedsOk;
-        summary.rss.fetched = rssResult.fetched;
-        summary.rss.errors = rssResult.outcomes.filter((o) => o.status === "error").length;
-        await ingestRssArticles(rssResult.articles, summary, scan.lastSuccessfulScanAt);
+        await publishNextCandidate(summary);
       } catch (error) {
-        const message = errorMessage(error);
-        summary.discoveryError = summary.discoveryError
-          ? `${summary.discoveryError}; RSS: ${message}`
-          : `RSS: ${message}`;
+        summary.publish.error = errorMessage(error);
       }
     }
 

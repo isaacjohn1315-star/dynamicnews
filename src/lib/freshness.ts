@@ -70,7 +70,7 @@ export async function recordScan(successful: boolean): Promise<void> {
 export function evaluateFreshness(
   publishedAt: Date | null,
   provider: "newsdata" | "rss",
-  lastSuccessfulScanAt: string | null,
+  _lastSuccessfulScanAt: string | null,
   now: Date = new Date(),
 ): FreshnessVerdict {
   if (!publishedAt || Number.isNaN(publishedAt.getTime())) {
@@ -94,9 +94,14 @@ export function evaluateFreshness(
     };
   }
 
-  const windowStart = now.getTime() - RECOVERY_WINDOW_MINUTES * 60_000;
-  const checkpoint = lastSuccessfulScanAt ? Date.parse(lastSuccessfulScanAt) : Number.NaN;
-  const cutoff = Number.isNaN(checkpoint) ? windowStart : Math.max(checkpoint, windowStart);
+  // The recovery window is the gate. Taking the previous-scan checkpoint as
+  // the cutoff instead made the effective window only as long as the cron
+  // interval (~10 minutes), which silently discarded any article whose feed
+  // lagged by more than that — most feeds lag 10-30 minutes. Articles
+  // already seen in an earlier cycle are already excluded by the
+  // deduplication key, so widening the gate to the documented 60-minute
+  // window does not cause repeat posts; it only stops real news being lost.
+  const cutoff = now.getTime() - RECOVERY_WINDOW_MINUTES * 60_000;
 
   if (publishedAt.getTime() < cutoff) {
     return {

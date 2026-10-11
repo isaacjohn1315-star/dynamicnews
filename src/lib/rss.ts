@@ -33,19 +33,22 @@ export interface RssFeedConfig {
 export { FEED_CATALOGUE };
 
 const USER_AGENT = "DynaSport/1.0 (+football news monitoring; contact via DynaSport Facebook page)";
-const FETCH_TIMEOUT_MS = 6_000;
+const FETCH_TIMEOUT_MS = 5_000;
 const MAX_ITEMS_PER_FEED = 40;
 const FAILURE_BACKOFF_THRESHOLD = 3;
 const FAILURE_BACKOFF_MINUTES = 90;
 
 /**
- * Feeds polled per run. cron-job.org aborts after 30s, so each run takes a
- * rotating slice (least-recently-fetched first) and the remaining feeds are
- * covered by subsequent runs. At 144 runs/day this still gives the whole
- * catalogue many passes per day.
+ * Feeds polled per run. This is sized against the freshness window: with
+ * 624 feeds, a 10-minute cron cadence gives 6 runs per hour, so ~104 feeds
+ * per run is needed to cycle the entire catalogue inside 60 minutes. The
+ * previous value of 14 produced a ~7.5-hour cycle, which meant almost no
+ * article could still be inside the freshness window when its feed was
+ * polled. Rotation stays least-recently-fetched-first, and the run deadline
+ * still cuts fetching short if feeds respond slowly.
  */
-const MAX_FEEDS_PER_RUN = 14;
-const FETCH_CONCURRENCY = 14;
+const MAX_FEEDS_PER_RUN = 130;
+const FETCH_CONCURRENCY = 45;
 
 export interface RssArticle {
   feedName: string;
@@ -120,7 +123,10 @@ export async function fetchRssFeeds(deadline?: number): Promise<RssDiscoveryResu
  */
 async function ensureFeedRows(sql: SqlClient): Promise<void> {
   const countRows = (await sql`SELECT count(*)::int AS n FROM rss_feeds`) as { n: number }[];
-  if ((countRows[0]?.n ?? 0) === FEED_CATALOGUE.length) return;
+  const registered = countRows[0]?.n ?? 0;
+
+  // Already in sync: no write at all, so a normal run costs one cheap count.
+  if (registered === FEED_CATALOGUE.length) return;
 
   const names = FEED_CATALOGUE.map((f) => f.name);
   const topics = FEED_CATALOGUE.map((f) => f.topic);
@@ -134,6 +140,16 @@ async function ensureFeedRows(sql: SqlClient): Promise<void> {
           topic = EXCLUDED.topic,
           updated_at = now()
   `;
+
+  // Self-healing: drop rows that no longer exist in the catalogue, so a
+  // stale count can never block re-registration and removed feeds do not
+  // linger as permanently "failing" on the dashboard.
+  if (registered > FEED_CATALOGUE.length) {
+    await sql`
+      DELETE FROM rss_feeds
+      WHERE url <> ALL (${urls}::text[])
+    `;
+  }
 }
 
 async function fetchOneFeed(

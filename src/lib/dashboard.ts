@@ -1,4 +1,4 @@
-import { ensureSchema, getDb } from "./db";
+import { dbTransport, ensureSchema, getDb, type SqlClient } from "./db";
 import { getBudgetStats } from "./request-budget";
 import { getPublishState, type PublishState } from "./publishing";
 import { getScanState } from "./freshness";
@@ -81,6 +81,17 @@ export interface DashboardFeed {
 
 export interface DashboardData {
   generatedAt: string;
+  transport: "neon-https" | "postgres-tcp" | "not-configured";
+  feedSummary: {
+    total: number;
+    catalogue: number;
+    healthy: number;
+    failing: number;
+    untested: number;
+    backoff: number;
+    /** Feeds shown in the list — the catalogue is too long to render fully. */
+    shown: number;
+  };
   budget: {
     day: string;
     used: number;
@@ -111,14 +122,6 @@ export interface DashboardData {
   };
   publish: PublishState;
   scan: { lastScanAt: string | null; lastSuccessfulScanAt: string | null };
-  feedSummary: {
-    total: number;
-    catalogue: number;
-    healthy: number;
-    failing: number;
-    untested: number;
-    backoff: number;
-  };
   lastRun: DashboardRun | null;
   lastSuccessfulRun: DashboardRun | null;
   recentRuns: DashboardRun[];
@@ -280,6 +283,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
 
     return {
       generatedAt: new Date().toISOString(),
+      transport: dbTransport(),
       budget,
       newsdataHealth: {
         lastSuccessAt: isoStringOrNull(health.last_success_at),
@@ -312,6 +316,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         failing: feedStatsRows[0]?.failing ?? 0,
         untested: feedStatsRows[0]?.untested ?? 0,
         backoff: feedStatsRows[0]?.backoff ?? 0,
+        shown: Math.min(feedRows.length, 60),
       },
       lastRun: recentRuns[0] ?? null,
       lastSuccessfulRun: lastSuccessRows[0] ? toRun(lastSuccessRows[0]) : null,

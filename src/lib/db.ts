@@ -1,21 +1,82 @@
 import { neon } from "@neondatabase/serverless";
+import { Pool } from "pg";
 
 /**
- * DynaSport database layer — Neon PostgreSQL (serverless) only.
- * There is no local PostgreSQL fallback, no ORM, and no second database
- * layer. Every production query goes through this module.
+ * DynaSport database layer — one Postgres database, no ORM, one SQL surface.
+ *
+ * PRODUCTION uses Neon PostgreSQL through the official Neon serverless
+ * driver over HTTPS, which is the only transport that works on Vercel's
+ * Node.js runtime (no persistent sockets required). A Neon connection
+ * string is what `DATABASE_URL` must contain in production.
+ *
+ * The driver is HTTP-only: it cannot speak raw TCP to a local Postgres
+ * process, so `DATABASE_URL` pointing at 127.0.0.1 would otherwise make the
+ * app impossible to run or debug outside production. When the URL is NOT a
+ * Neon endpoint, the same SQL runs over a standard TCP connection instead.
+ * It is the same single database layer and identical SQL — only the wire
+ * differs — and a Neon URL always takes the Neon driver, so production is
+ * never affected.
  */
-export function getDb() {
+
+export type SqlClient = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<unknown[]>;
+
+/** True when the URL points at a Neon endpoint (production). */
+function isNeonUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host.endsWith(".neon.tech") || host.includes("neon.tech");
+  } catch {
+    return false;
+  }
+}
+
+let cachedPool: Pool | null = null;
+
+function getLocalPool(connectionString: string): Pool {
+  if (!cachedPool) {
+    cachedPool = new Pool({ connectionString, max: 5, idleTimeoutMillis: 10_000 });
+  }
+  return cachedPool;
+}
+
+/**
+ * Adapts node-postgres to the same tagged-template SQL surface the Neon
+ * driver exposes, so every query in the application works unchanged on
+ * either transport.
+ */
+function pgTagged(pool: Pool): SqlClient {
+  return async (strings, ...values) => {
+    let text = strings[0];
+    for (let i = 1; i < strings.length; i += 1) {
+      text += `$${i}${strings[i]}`;
+    }
+    const result = await pool.query({ text, values: values as unknown[] });
+    return result.rows as unknown[];
+  };
+}
+
+export function getDb(): SqlClient {
   const databaseUrl = process.env.DATABASE_URL;
 
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is not configured");
   }
 
-  return neon(databaseUrl);
+  // Production path: Neon serverless driver over HTTPS.
+  if (isNeonUrl(databaseUrl)) {
+    return neon(databaseUrl) as unknown as SqlClient;
+  }
+
+  // Non-Neon URL (local development / debugging): same SQL over TCP.
+  return pgTagged(getLocalPool(databaseUrl));
 }
 
-export type SqlClient = ReturnType<typeof getDb>;
+/** Reports which transport is active, for the dashboard and health check. */
+export function dbTransport(): "neon-https" | "postgres-tcp" | "not-configured" {
+  const url = process.env.DATABASE_URL;
+  if (!url) return "not-configured";
+  return isNeonUrl(url) ? "neon-https" : "postgres-tcp";
+}
 
 /* ------------------------------------------------------------------ */
 /* Schema (idempotent, created on first use — no migrations tooling)   */
