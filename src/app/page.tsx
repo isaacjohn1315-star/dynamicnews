@@ -318,7 +318,7 @@ function BudgetCard({ data }: { data: DashboardData }) {
 function KpiGrid({ totals, publish }: { totals: DashboardData["totals"]; publish: DashboardData["publish"] }) {
   return (
     <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:col-span-2">
-      <Kpi icon={<Send className="h-4 w-4" />} label="Published today" value={publish.ordinaryUsed + publish.emergencyUsed} sub={`limit ${publish.totalLimit}/day · target 3-5`} tone="lime" />
+      <Kpi icon={<Send className="h-4 w-4" />} label="Published today" value={publish.postsToday} sub="no daily cap — quality gated" tone="lime" />
       <Kpi icon={<Timer className="h-4 w-4" />} label="Publishing queue" value={totals.queue} sub={`${formatInteger(totals.awaitingRetry)} awaiting retry`} tone="sky" />
       <Kpi icon={<Copy className="h-4 w-4" />} label="Duplicates blocked" value={totals.duplicates} sub={`${formatInteger(totals.exactDuplicates)} exact · ${formatInteger(totals.storyDuplicates)} same story`} tone="violet" />
       <Kpi icon={<Funnel className="h-4 w-4" />} label="Filtered out" value={totals.rejected} sub={`${formatInteger(totals.rejectedStale)} stale · rest irrelevant`} tone="zinc" />
@@ -760,7 +760,7 @@ function ContinuousCard({
           </dd>
         </div>
         <div className="flex items-center justify-between gap-2">
-          <dt className="text-zinc-500">Daily target</dt>
+          <dt className="text-zinc-500">Daily run target</dt>
           <dd className="font-mono tabular-nums text-zinc-300">{EXPECTED_RUNS_PER_DAY} runs / 24h</dd>
         </div>
         <div className="flex items-center justify-between gap-2">
@@ -782,7 +782,7 @@ function ContinuousCard({
           </dd>
         </div>
         <div className="flex items-center justify-between gap-2">
-          <dt className="text-zinc-500">Next post allowed</dt>
+          <dt className="text-zinc-500">Next post eligible</dt>
           <dd className="font-mono tabular-nums text-zinc-300">
             {publish.nextEligibleAt && Date.parse(publish.nextEligibleAt) > Date.now()
               ? `${formatDateTime(publish.nextEligibleAt)} UTC`
@@ -790,10 +790,9 @@ function ContinuousCard({
           </dd>
         </div>
         <div className="flex items-center justify-between gap-2">
-          <dt className="text-zinc-500">Posts used today</dt>
+          <dt className="text-zinc-500">Ordinary post spacing</dt>
           <dd className="font-mono tabular-nums text-zinc-300">
-            {publish.ordinaryUsed}/{publish.ordinaryLimit} ordinary
-            {publish.emergencyUsed > 0 ? ` +${publish.emergencyUsed} breaking` : ""}
+            {publish.spacingMinutes} min (bypassed by top stories)
           </dd>
         </div>
       </dl>
