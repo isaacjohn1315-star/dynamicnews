@@ -37,13 +37,21 @@ const MAX_TOTAL = 480;
 const STAGE_CAVEAT: Record<StoryStage, string | null> = {
   official: null,
   agreement:
-    "An agreement at this stage is not the same as a completed move, which is only final once the clubs confirm it.",
-  bid: "A bid alone does not mean a deal is agreed, and the receiving club can still reject it.",
+    "An agreement is not the same as a completed move, which is only final once the clubs confirm it.",
+  bid: "A bid alone does not mean a deal is agreed, and the selling club can still turn it down.",
   talks: "Talks do not guarantee an agreement, and no deal is in place while negotiations continue.",
   rumour:
     "This is a report rather than a confirmed move, and interest alone does not mean an offer has been made.",
   general: null,
 };
+
+/**
+ * Hedging language a publisher may already use in their own summary. When
+ * the detail sentence already carries it, the stage caveat is shortened so
+ * the post does not hedge the same thing twice.
+ */
+const HEDGED_ALREADY =
+  /\b(according to reports?|reports? claim|reportedly|it is (?:claimed|reported)|understood to|are said to|is said to|have reportedly|has reportedly|rumou?rs?|sources? (?:say|claim)|claims? the)\b/i;
 
 /**
  * Builds the explanation. Prefers the publisher's own summary sentence
@@ -56,8 +64,15 @@ export function buildExplanation(
   stage: StoryStage,
   isRumour: boolean,
 ): string | null {
-  const caveat = isRumour ? (STAGE_CAVEAT[stage] ?? STAGE_CAVEAT.rumour) : STAGE_CAVEAT[stage];
+  const baseCaveat = isRumour ? (STAGE_CAVEAT[stage] ?? STAGE_CAVEAT.rumour) : STAGE_CAVEAT[stage];
   const detail = extractDetailSentence(description, headline);
+
+  // Avoid hedging twice when the publisher's own summary already signals
+  // that the claim is a report.
+  const caveat =
+    detail && baseCaveat && HEDGED_ALREADY.test(detail) && stage !== "official"
+      ? "Nothing has been confirmed by the clubs involved yet."
+      : baseCaveat;
 
   if (detail && caveat) {
     const combined = `${detail} ${caveat}`;
@@ -90,7 +105,7 @@ function extractDetailSentence(description: string | null, headline: string): st
   const sentences = text
     .split(/(?<=[.!?])\s+/)
     .map((s) => s.trim())
-    .filter((s) => s.length >= 40 && s.length <= MAX_EXPLANATION);
+    .filter((s) => s.length >= 30 && s.length <= MAX_EXPLANATION);
 
   for (const sentence of sentences) {
     if (/^(by |read more|click|subscribe|sign up|follow us|get the latest|watch:|listen)/i.test(sentence)) {
@@ -99,7 +114,9 @@ function extractDetailSentence(description: string | null, headline: string): st
     if (/https?:\/\/|www\.|#\w/.test(sentence)) continue;
 
     const words = sentence.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 3);
-    if (words.length < 6) continue;
+    // Four meaningful words is enough for a genuine publisher summary; the
+    // previous six-word floor rejected legitimate short wire-style lines.
+    if (words.length < 4) continue;
     // Require genuinely new information rather than a restated headline.
     const overlap = words.filter((w) => headlineWords.has(w)).length / words.length;
     if (overlap > 0.7) continue;

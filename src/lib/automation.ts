@@ -13,6 +13,7 @@ import {
   findDuplicateStory,
   normalizeSourceName,
   parsePubDate,
+  rateSource,
   type NormalizedArticle,
   type StoryTokenSet,
 } from "./relevance";
@@ -23,7 +24,7 @@ import { evaluateFreshness, getScanState, recordScan } from "./freshness";
 import {
   claimPublishSlot,
   getPublishState,
-  qualifiesForEmergency,
+  isHighPriorityStory,
   releasePublishSlot,
   type SlotRefusal,
 } from "./publishing";
@@ -36,7 +37,8 @@ import { buildStoryIdentity, isMaterialFollowUp, STAGE_RANK, type StoryStage, ty
  *   cron-job.org (every 10 minutes, around the clock)
  *     -> protected /api/football/automation endpoint
  *     -> single-flight lease (overlapping runs exit early)
- *     -> atomic publish of the next queued story (retry-safe; uncertain
+ *     -> paced publish of the next queued story, one per run, no daily cap
+ *        (retry-safe; uncertain
  *        Facebook outcomes are reconciled before any retry)
  *     -> shared daily budget check (max 200 NewsData.io requests/day)
  *     -> NewsData.io discovery (at most one request per run)
@@ -96,12 +98,13 @@ export interface AutomationSummary {
     attempted: boolean;
     published: boolean;
     reconciled: boolean;
-    emergency: boolean;
+    /** True when the story bypassed ordinary spacing (breaking news). */
+    highPriority: boolean;
     itemId: string | null;
     fbPostId: string | null;
     error: string | null;
     skippedReason: SlotRefusal | "no_candidate" | null;
-    ordinaryUsedToday: number;
+    postsToday: number;
     nextEligibleAt: string | null;
   };
   discoveryError: string | null;
@@ -134,9 +137,9 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
     rss: { feedsChecked: 0, feedsOk: 0, fetched: 0, newCandidates: 0, rejected: 0, duplicatesSkipped: 0, errors: 0 },
     notNewRejected: 0,
     publish: {
-      attempted: false, published: false, reconciled: false, emergency: false,
+      attempted: false, published: false, reconciled: false, highPriority: false,
       itemId: null, fbPostId: null, error: null, skippedReason: null,
-      ordinaryUsedToday: 0, nextEligibleAt: null,
+      postsToday: 0, nextEligibleAt: null,
     },
     discoveryError: null,
     error: null,
@@ -290,16 +293,22 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
 
   // Peek at the best eligible candidate BEFORE consuming a publishing slot.
   const peek = (await sql`
-    SELECT id, relevance_score, story_stage_rank, is_rumour
+    SELECT id, relevance_score, story_stage_rank, is_rumour, source_name
     FROM news_items
     WHERE status = 'candidate'
       AND (next_retry_at IS NULL OR next_retry_at <= now())
     ORDER BY relevance_score DESC, published_at DESC NULLS LAST, created_at ASC
     LIMIT 1
-  `) as { id: string; relevance_score: number; story_stage_rank: number; is_rumour: boolean }[];
+  `) as {
+    id: string;
+    relevance_score: number;
+    story_stage_rank: number;
+    is_rumour: boolean;
+    source_name: string | null;
+  }[];
 
   const state = await getPublishState();
-  summary.publish.ordinaryUsedToday = state.ordinaryUsed;
+  summary.publish.postsToday = state.postsToday;
   summary.publish.nextEligibleAt = state.nextEligibleAt;
 
   if (peek.length === 0) {
@@ -307,22 +316,29 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
     return;
   }
 
-  // Only a confirmed, exceptional story may use the emergency allowance.
-  const emergency = qualifiesForEmergency(
+  // A high-priority story bypasses the ordinary spacing interval. This
+  // covers confirmed announcements AND significant rumours from credible
+  // reporters, because transfer rumours are core football-news content.
+  // It is a pacing bypass only — there is no daily allowance, so no story
+  // is ever held back by a post counter.
+  const highPriority = isHighPriorityStory(
     peek[0].relevance_score,
     peek[0].story_stage_rank ?? 0,
     peek[0].is_rumour,
+    rateSource(peek[0].source_name, null),
   );
 
-  const slot = await claimPublishSlot(emergency);
-  summary.publish.ordinaryUsedToday = slot.ordinaryUsed;
+  const slot = await claimPublishSlot(highPriority);
+  summary.publish.postsToday = slot.postsToday;
   summary.publish.nextEligibleAt = slot.nextEligibleAt;
   if (!slot.granted) {
-    // Caps/cooldown reached: keep discovering, publish nothing this run.
+    // Ordinary post inside the short spacing window: nothing is published
+    // this run, and the story simply goes out on the next run. Discovery,
+    // filtering and deduplication continue regardless.
     summary.publish.skippedReason = slot.reason;
     return;
   }
-  summary.publish.emergency = emergency;
+  summary.publish.highPriority = highPriority;
 
   // Atomically claim exactly one candidate article.
   const claimed = (await sql`
@@ -350,7 +366,7 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
   >[];
 
   if (claimed.length === 0) {
-    await releasePublishSlot(emergency);
+    await releasePublishSlot();
     summary.publish.skippedReason = "no_candidate";
     return;
   }
@@ -361,7 +377,7 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
 
   if (!item.post_text || !isValidPostText(item.post_text)) {
     await releaseClaim(item.id, item.attempts, "Stored post text failed DynaSport format validation");
-    await releasePublishSlot(emergency);
+    await releasePublishSlot();
     summary.publish.error = "Stored post text failed format validation; item rescheduled";
     return;
   }
@@ -387,7 +403,7 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
             updated_at = now()
         WHERE id = ${item.id}
       `;
-      await releasePublishSlot(emergency);
+      await releasePublishSlot();
       summary.duplicatesSkipped += 1;
       summary.dedupe.storyDuplicates += 1;
       return;
@@ -423,7 +439,7 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
       }
     }
     await releaseClaim(item.id, item.attempts, message);
-    await releasePublishSlot(emergency);
+    await releasePublishSlot();
     summary.publish.error = message;
   }
 }

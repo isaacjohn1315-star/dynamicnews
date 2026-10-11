@@ -1,56 +1,108 @@
 import { ensureSchema, getDb } from "./db";
+import type { SourceCredibility } from "./relevance";
 
 /**
- * Facebook publishing governor.
+ * Facebook publishing pacing.
  *
- * Discovering news does not mean publishing it. DynaSport behaves like a
- * selective editorial page:
+ * There is NO daily posting cap. DynaSport never limits how many legitimate
+ * football stories it can publish in a day: if eight genuinely important
+ * new stories qualify, all eight are published; if none qualify, nothing is
+ * published. Quality control happens in the relevance, freshness, source
+ * and duplicate layers — not here.
  *
- *   - target 3-5 quality posts per UTC day;
- *   - HARD cap of 5 ordinary posts per UTC day;
- *   - at most 1 ordinary post per 30 minutes;
- *   - at most 1 post per scheduled run;
- *   - a genuinely major breaking event may use a small emergency
- *     allowance, with an absolute ceiling of 6 posts per day.
+ * Meta's Graph API applies no fixed posts-per-day ceiling either. Its rate
+ * limits scale with the Page's engaged users over a rolling 24 hours, and
+ * news Pages routinely publish far more than a handful of posts a day. The
+ * only pacing kept here is therefore politeness, not restriction:
  *
- * All counters live in Neon (`publish_state`), keyed by UTC day, and the
- * cooldown is persisted in `next_eligible_publish_at` so redeploys and
- * cold starts cannot reset it. Slots are claimed with a single atomic
- * statement, so simultaneous runs can never exceed the caps.
+ *   - exactly ONE post per automation run, so posts are always sequential
+ *     and never batched (the 10-minute cron cadence naturally spaces them);
+ *   - a short spacing interval between ordinary posts, so Facebook has time
+ *     to process each request;
+ *   - a verified high-priority breaking story BYPASSES that spacing, so a
+ *     soft interval can never hold back real news.
+ *
+ * `next_eligible_publish_at` is persisted in Neon so redeploys and cold
+ * starts cannot reset it. Slots are claimed in a single atomic statement,
+ * which keeps overlapping workers from posting twice without imposing any
+ * daily ceiling.
  */
 
-export const DAILY_ORDINARY_POST_LIMIT = 5;
-export const DAILY_TOTAL_POST_LIMIT = 6;
-export const POST_COOLDOWN_MINUTES = 30;
-export const TARGET_POSTS_PER_DAY = "3-5";
+/**
+ * Minimum minutes between ordinary posts. Short by design: it exists only
+ * to avoid firing a burst of requests at Facebook. Adjust this constant to
+ * change pacing — it never blocks a qualifying high-priority story.
+ */
+export const POST_SPACING_MINUTES = 3;
 
-/** Relevance score a story must reach to spend the emergency allowance. */
-export const EMERGENCY_SCORE_THRESHOLD = 110;
+/**
+ * Relevance score at which a story is treated as high-priority and skips
+ * the ordinary spacing interval. Only confirmed, non-rumour developments
+ * qualify — never an ordinary transfer rumour.
+ */
+export const HIGH_PRIORITY_SCORE_THRESHOLD = 100;
+
+/** Relevance stage rank required for a confirmed story ("official" = 5). */
+export const HIGH_PRIORITY_STAGE_RANK = 5;
+
+/**
+ * Relevance score at which a RUMOUR skips the spacing interval. Transfer
+ * rumours are core football-news content — a major exclusive from a
+ * credible reporter is exactly what a football page posts immediately — so
+ * this route is limited to credible sources (see isHighPriorityStory).
+ */
+export const RUMOUR_HIGH_PRIORITY_SCORE_THRESHOLD = 105;
 
 export function publishDayKey(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);
 }
 
-export type SlotRefusal =
-  | "daily_ordinary_cap"
-  | "daily_total_cap"
-  | "cooldown"
-  | "no_emergency_justification";
+/** Why a run published nothing. There is deliberately no daily-cap reason. */
+export type SlotRefusal = "spacing" | null;
 
 export interface SlotClaim {
   granted: boolean;
-  emergency: boolean;
-  reason: SlotRefusal | null;
-  ordinaryUsed: number;
-  emergencyUsed: number;
+  highPriority: boolean;
+  reason: SlotRefusal;
+  postsToday: number;
   nextEligibleAt: string | null;
 }
 
 /**
- * Atomically claims a publishing slot. Must be called immediately before
- * posting; `releasePublishSlot` gives it back if the post does not happen.
+ * Decides whether a story qualifies as high priority and skips the ordinary
+ * spacing interval.
+ *
+ * Two routes, both requiring real editorial weight:
+ *
+ *  1. A confirmed development at the "official" stage.
+ *  2. A significant rumour, negotiation or bid from a credible source —
+ *     because transfer rumours are exactly what football news pages publish
+ *     immediately. Weak or unknown sources never qualify on this route, so
+ *     aggregator blogs cannot jump the queue.
  */
-export async function claimPublishSlot(isEmergency: boolean): Promise<SlotClaim> {
+export function isHighPriorityStory(
+  score: number,
+  stageRank: number,
+  isRumour: boolean,
+  credibility: SourceCredibility,
+): boolean {
+  const credible = credibility === "top" || credibility === "mainstream";
+
+  // Confirmed developments.
+  if (!isRumour && stageRank >= HIGH_PRIORITY_STAGE_RANK && score >= HIGH_PRIORITY_SCORE_THRESHOLD) {
+    return true;
+  }
+
+  // Significant rumours, talks and bids from credible reporters.
+  return credible && score >= RUMOUR_HIGH_PRIORITY_SCORE_THRESHOLD;
+}
+
+/**
+ * Atomically claims the single publishing slot for this run. Grants unless
+ * an ordinary post would fall inside the short spacing window. There is no
+ * daily counter to exhaust.
+ */
+export async function claimPublishSlot(highPriority: boolean): Promise<SlotClaim> {
   await ensureSchema();
   const sql = getDb();
   const day = publishDayKey();
@@ -60,95 +112,83 @@ export async function claimPublishSlot(isEmergency: boolean): Promise<SlotClaim>
     ON CONFLICT (day) DO NOTHING
   `;
 
-  // One statement decides and reserves: cooldown, ordinary cap and total
-  // cap are all evaluated inside the UPDATE's WHERE clause.
+  // The spacing window is the ONLY condition. High-priority stories ignore
+  // it entirely; ordinary posts respect it.
   const rows = (await sql`
     UPDATE publish_state
-    SET ordinary_posts = ordinary_posts + ${isEmergency ? 0 : 1},
-        emergency_posts = emergency_posts + ${isEmergency ? 1 : 0},
+    SET posts_total = posts_total + 1,
         last_published_at = now(),
-        next_eligible_publish_at = now() + make_interval(mins => ${POST_COOLDOWN_MINUTES}),
+        next_eligible_publish_at = now() + make_interval(mins => ${POST_SPACING_MINUTES}),
         updated_at = now()
     WHERE day = ${day}
-      AND (next_eligible_publish_at IS NULL OR next_eligible_publish_at <= now())
-      AND (ordinary_posts + emergency_posts) < ${DAILY_TOTAL_POST_LIMIT}
-      AND (${isEmergency} OR ordinary_posts < ${DAILY_ORDINARY_POST_LIMIT})
-    RETURNING ordinary_posts, emergency_posts, next_eligible_publish_at
-  `) as { ordinary_posts: number; emergency_posts: number; next_eligible_publish_at: string | null }[];
+      AND (
+        ${highPriority}
+        OR next_eligible_publish_at IS NULL
+        OR next_eligible_publish_at <= now()
+      )
+    RETURNING posts_total, next_eligible_publish_at
+  `) as { posts_total: number; next_eligible_publish_at: string | null }[];
 
   if (rows.length > 0) {
     return {
       granted: true,
-      emergency: isEmergency,
+      highPriority,
       reason: null,
-      ordinaryUsed: rows[0].ordinary_posts,
-      emergencyUsed: rows[0].emergency_posts,
+      postsToday: rows[0].posts_total,
       nextEligibleAt: rows[0].next_eligible_publish_at,
     };
   }
 
   const state = await getPublishState();
-  let reason: SlotRefusal = "cooldown";
-  if (state.ordinaryUsed + state.emergencyUsed >= DAILY_TOTAL_POST_LIMIT) {
-    reason = "daily_total_cap";
-  } else if (!isEmergency && state.ordinaryUsed >= DAILY_ORDINARY_POST_LIMIT) {
-    reason = "daily_ordinary_cap";
-  }
-
   return {
     granted: false,
-    emergency: isEmergency,
-    reason,
-    ordinaryUsed: state.ordinaryUsed,
-    emergencyUsed: state.emergencyUsed,
+    highPriority,
+    reason: "spacing",
+    postsToday: state.postsToday,
     nextEligibleAt: state.nextEligibleAt,
   };
 }
 
 /**
- * Returns an unused slot (e.g. the Facebook call failed). The cooldown is
- * also rewound so a transient failure does not cost 30 minutes of silence.
+ * Returns an unused slot (e.g. the Facebook call failed). Eligibility is
+ * moved forward immediately so a transient failure costs almost no time.
  */
-export async function releasePublishSlot(isEmergency: boolean): Promise<void> {
+export async function releasePublishSlot(): Promise<void> {
   try {
     const sql = getDb();
     const day = publishDayKey();
     await sql`
       UPDATE publish_state
-      SET ordinary_posts = GREATEST(0, ordinary_posts - ${isEmergency ? 0 : 1}),
-          emergency_posts = GREATEST(0, emergency_posts - ${isEmergency ? 1 : 0}),
-          next_eligible_publish_at = now() + make_interval(mins => 2),
+      SET posts_total = GREATEST(0, posts_total - 1),
+          next_eligible_publish_at = now(),
           updated_at = now()
       WHERE day = ${day}
     `;
   } catch {
-    // If this fails the slot simply stays consumed — safe (under-posting).
+    // If this fails the slot stays consumed — safe (under-posting).
   }
 }
 
 export interface PublishState {
   day: string;
-  ordinaryUsed: number;
-  emergencyUsed: number;
-  ordinaryLimit: number;
-  totalLimit: number;
+  postsToday: number;
+  spacingMinutes: number;
   nextEligibleAt: string | null;
   lastPublishedAt: string | null;
-  cooldownMinutes: number;
 }
 
+/** Read-only view for the dashboard. Carries no limits. */
 export async function getPublishState(): Promise<PublishState> {
   await ensureSchema();
   const sql = getDb();
   const day = publishDayKey();
 
   const rows = (await sql`
-    SELECT ordinary_posts, emergency_posts, next_eligible_publish_at, last_published_at
+    SELECT posts_total, next_eligible_publish_at, last_published_at
     FROM publish_state
     WHERE day = ${day}
   `) as {
-    ordinary_posts: number;
-    emergency_posts: number;
+    posts_total: number | null;
     next_eligible_publish_at: string | null;
     last_published_at: string | null;
   }[];
@@ -156,23 +196,9 @@ export async function getPublishState(): Promise<PublishState> {
   const row = rows[0];
   return {
     day,
-    ordinaryUsed: row?.ordinary_posts ?? 0,
-    emergencyUsed: row?.emergency_posts ?? 0,
-    ordinaryLimit: DAILY_ORDINARY_POST_LIMIT,
-    totalLimit: DAILY_TOTAL_POST_LIMIT,
+    postsToday: row?.posts_total ?? 0,
+    spacingMinutes: POST_SPACING_MINUTES,
     nextEligibleAt: row?.next_eligible_publish_at ?? null,
     lastPublishedAt: row?.last_published_at ?? null,
-    cooldownMinutes: POST_COOLDOWN_MINUTES,
   };
-}
-
-/**
- * Only a confirmed, high-scoring official development may use the
- * emergency allowance. Ordinary transfer rumours, routine injuries and
- * minor updates never qualify.
- */
-export function qualifiesForEmergency(score: number, stageRank: number, isRumour: boolean): boolean {
-  if (isRumour) return false;
-  if (stageRank < 5) return false; // "official" only
-  return score >= EMERGENCY_SCORE_THRESHOLD;
 }

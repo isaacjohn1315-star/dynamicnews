@@ -60,7 +60,7 @@ const STAGE_PATTERNS: { stage: StoryStage; pattern: RegExp }[] = [
   {
     stage: "rumour",
     pattern:
-      /\b(rumou?rs?|rumou?red|reportedly|linked|interest(?:ed|s)?\b|eye(?:ing|d)\b|targets?(?:ing)?\b|considering|monitoring|plots?|weigh(?:s|ing)? up|keen on|wants? to sign|could (?:sign|join|move)|set to\b|expected to|hopes? to|race for|chas(?:e|es|ing)|tracking|scout(?:ing|ed)|shortlist(?:ed)?)\b/i,
+      /\b(rumou?rs?|rumou?red|reportedly|report(?:s)? claim|according to reports|linked|interest(?:ed|s)?\b|eye(?:ing|d)\b|targets?(?:ing)?\b|considering|monitoring|plots?|plans? to\b|plans? (?:to sign|a move|a bid|a deal)|weigh(?:s|ing)? up|keen on|wants? to sign|could (?:sign|join|move)|set to\b|expected to|hopes? to|race for|chas(?:e|es|ing)|tracking|scout(?:ing|ed)|shortlist(?:ed)?)\b/i,
   },
 ];
 
@@ -76,42 +76,125 @@ export function classifyStage(text: string): StoryStage {
 /* ------------------------------------------------------------------ */
 
 export type EventKind =
+  | "here_we_go"
+  | "medical"
   | "transfer"
+  | "loan"
+  | "contract"
   | "manager"
   | "injury"
+  | "comeback"
   | "discipline"
-  | "contract"
+  | "legal"
+  | "finance"
   | "quote"
+  | "match"
+  | "lineup"
+  | "dressing_room"
+  | "youth"
+  | "retirement"
+  | "agent"
+  | "award"
+  | "international"
   | "competition"
   | "club"
   | "other";
 
 const EVENT_KIND_PATTERNS: { kind: EventKind; pattern: RegExp }[] = [
+  // "Here we go" announcements — the strongest single signal in football news
+  {
+    kind: "here_we_go",
+    pattern: /\b(here we go|here we actually go|done deal|deal sealed|deal struck)\b/i,
+  },
+  // Medicals are a distinct, high-interest stage of a transfer
+  {
+    kind: "medical",
+    pattern:
+      /\b(medical(?:s)?\b|passes medical|medical booked|set for a medical|undergo(?:es|ing)? a medical|medical tests)\b/i,
+  },
   {
     kind: "manager",
     pattern:
-      /\b(manager|head coach|boss|sacked|sack|dismissed|appointed|appointment|caretaker|interim|steps? down|resigns?|successor|dugout|technical director|sporting director)\b/i,
+      /\b(manager|head coach|boss|sacked|sack|dismissed|appointed|appointment|caretaker|interim|steps? down|resigns?|successor|dugout|part(?:s|ed)? company|sporting director|director of football|technical director)\b/i,
+  },
+  {
+    kind: "comeback",
+    pattern:
+      /\b(returns? to (?:training|action|the squad)|back in (?:training|contention)|comeback|fit again|available again|recovery|setback after|returns? from injury)\b/i,
   },
   {
     kind: "injury",
-    pattern: /\b(injur(?:y|ed|ies)|fitness|surgery|operation|ruled out|sidelined|setback|recovery|hamstring|acl|ankle|knee|calf|groin|out for)\b/i,
+    pattern:
+      /\b(injur(?:y|ed|ies)|fitness|surgery|operation|ruled out|sidelined|out for|hamstring|acl|ankle|knee|calf|groin|scan)\b/i,
   },
   {
-    kind: "discipline",
-    pattern: /\b(ban(?:ned|s)?|suspend(?:ed|sion)?|red card|charged|charge|fined?|sanction|points deduction|deducted|appeal|investigation|doping)\b/i,
+    kind: "legal",
+    pattern:
+      /\b(lawsuit|court|tribunal|legal(?:ly)? |legal action|sues|sued|settles?|police|charged with|prosecut|winding-?up)\b/i,
+  },
+  {
+    kind: "finance",
+    pattern:
+      /\b(financial fair play|profit and sustainability|ffp|points deduction|administration|winding-?up|debt|accounts|wages? bill|losses|breach|takeover|ownership|owner|investor|bidders?|consortium|acquisition)\b/i,
+  },
+  {
+    kind: "loan",
+    pattern: /\b(loan(?:s|ed|ing| deal| move| spell| with option|\-to\-buy)?|option to buy|obligation to buy|recall(?:ed)?)\b/i,
   },
   {
     kind: "contract",
-    pattern: /\b(contract|new deal|extension|extends?|renew(?:s|al|ed)?|terms until|release clause|wages|salary|pay rise)\b/i,
+    pattern:
+      /\b(contract|new deal|extension|extends?|renew(?:s|al|ed)?|terms until|release clause|buy-?back clause|pre\-contract|personal terms|triggers? option|contract situation|wages|salary|pay rise)\b/i,
   },
   {
     kind: "transfer",
     pattern:
-      /\b(transfer|signing|signs?|sign\b|bid|offer|move for|moves? to|joins?|loan|fee|deadline day|swap deal|buy-?back|free agent|departure|exit|sold|sell|purchase|recruit|negotiat\w*|linked|swoop|striker|midfielder|defender|winger|goalkeeper|forward)\b/i,
+      /\b(transfer|signing|signs?|sign\b|bid|offer|move for|moves? to|joins?|fee|deadline day|swap deal|buy-?back|free agent|free transfer|departure|exit|sold|sell|purchase|recruit|rejected|turned down|collapse[ds]?|deal off)\b/i,
+  },
+  {
+    kind: "retirement",
+    pattern:
+      /\b(retires?|retirement|hangs? up (?:his|her) boots|calls? time on|farewell|testimonial|one\-club man)\b/i,
+  },
+  {
+    kind: "agent",
+    pattern:
+      /\b(agent|agents|representative|intermediary|mino raiola|jorge mendes|changes? agent)\b/i,
+  },
+  {
+    kind: "lineup",
+    pattern:
+      /\b(starting xi|starting line-?up|line-?up|lineup|team news|predicted xi|named in the (?:squad|starting)|bench|in contention|expected to start)\b/i,
+  },
+  {
+    kind: "match",
+    pattern:
+      /\b(match report|player ratings|man of the match|win|wins|beat|beats|draw|victory|defeat|thrash|rout|late winner|stoppage time|injury time|hat-?trick|brace|clean sheet|post\-match|full\-time|half\-time|aggregate|matchday|preview|reaction|highlights)\b/i,
+  },
+  {
+    kind: "dressing_room",
+    pattern:
+      /\b(dressing(?: |\-)room|training ground|fallen out|clashed?|at odds|disagreement|dispute|heated (?:exchange|argument)|confrontation|unhappy|frustrated|tension|row|rift|bust\-up)\b/i,
+  },
+  {
+    kind: "youth",
+    pattern:
+      /\b(wonderkid|wonder kid|youngster|teenage|starlet|prodigy|academy|youth|breakthrough|first\-team debut|scholarship|signs first pro)\b/i,
+  },
+  {
+    kind: "award",
+    pattern:
+      /\b(ballon d'or|golden boot|award(?:s)?|nominee|shortlist(?:ed)?|player of the (?:year|month)|team of the (?:year|season)|record(?:s| holder)?|milestone|100th)\b/i,
+  },
+  {
+    kind: "international",
+    pattern:
+      /\b(called up|call\-up|national team|internationals?|squad announced|caps?|euro|world cup|nations league|friendly|qualifier)\b/i,
   },
   {
     kind: "quote",
-    pattern: /\b(says?|said|admits?|insists?|reveals?|claims?|hits? out|slams?|warns?|vows?|praises?|responds?|speaks? out|opens? up|explains?|denies)\b/i,
+    pattern:
+      /\b(says?|said|admits?|insists?|reveals?|claims?|hits? out|slams?|warns?|vows?|praises?|refuses?|demands?|hints?|opens? up|speaks? out|press conference|interview|responds?|told)\b/i,
   },
   {
     kind: "competition",
@@ -120,7 +203,8 @@ const EVENT_KIND_PATTERNS: { kind: EventKind; pattern: RegExp }[] = [
   },
   {
     kind: "club",
-    pattern: /\b(takeover|ownership|owner|stadium|board|investment|accounts|debt|sponsorship|rebrand|academy)\b/i,
+    pattern:
+      /\b(club statement|statement|stadium|board|rebrand|sponsorship|announce(?:s|d|ment)?)\b/i,
   },
 ];
 

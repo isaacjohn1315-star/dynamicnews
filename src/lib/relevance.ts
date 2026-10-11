@@ -122,45 +122,154 @@ const FOOTBALL_ENTITIES = [
   "wsl", "women's super league", "nwsl", "ballon d'or",
 ];
 
-/** High-significance developments (confirmed / breaking / structural). */
+/**
+ * High-significance developments (confirmed / breaking / structural).
+ * Covers official signings, "Here We Go" announcements, medicals, contract
+ * renewals, sackings, appointments, records, awards, retirements,
+ * comebacks, rejected bids, failed transfers, national-team selections,
+ * ownership changes and formal club announcements.
+ */
 const HIGH_SIGNAL = [
-  "breaking", "confirmed", "official", "announce", "announced", "announces", "completes",
-  "completed", "signs", "signed", "unveiled", "unveils", "done deal", "here we go",
-  "sacked", "sack", "dismissed", "appointed", "appointment", "named as", "statement",
+  // Official transfers and completed deals
+  "breaking", "confirmed", "official", "officially", "announce", "announced", "announces",
+  "completes", "completed", "signs", "signed", "signing", "unveiled", "unveils", "done deal",
+  "here we go", "permanent deal", "permanent transfer", "free transfer", "free agent",
+  "puts pen to paper", "pen to paper", "deal struck", "deal sealed", "sealed",
+  "personal terms agreed", "terms agreed", "agrees personal terms", "signs pre-contract",
+  "pre-contract agreement", "joins", "departs", "leaves", "recall", "recalled",
+  // Manager and staff
+  "sacked", "sack", "dismissed", "part company", "parts company", "appointed", "appointment",
+  "steps down", "stands down", "resigns", "resignation", "caretaker", "named as",
+  "sporting director", "director of football", "technical director",
+  // Contracts
   "agrees", "agreed", "agreement", "extends", "extension", "new contract", "contract until",
-  "medical", "undergoes", "surgery", "out for", "ruled out", "season-ending", "banned",
-  "suspended", "fined", "points deduction", "deducted", "takeover", "ownership",
-  "record fee", "club-record", "deadline day", "recall", "recalled", "departs", "leaves",
-  "joins", "signing",
+  "renews", "renewal", "triggers option", "option triggered", "extends stay",
+  // Medical and injury
+  "medical", "passes medical", "medical booked", "set for medical", "undergoes", "surgery",
+  "out for", "out for the season", "season-ending", "ruled out", "scan results",
+  "back in training", "returns to training", "available again", "comeback complete",
+  // Discipline
+  "banned", "suspended", "suspension", "fined", "charged", "charged with", "sanctioned",
+  "points deduction", "deducted", "investigation opened",
+  // Failed, cancelled and rejected transfers
+  "collapse", "collapses", "collapsed", "breaks down", "deal off", "off", "rejects",
+  "rejected", "turned down", "knock back", "knocked back", "refuses to sell", "snubs",
+  "snubbed", "collapsed deal",
+  // Records, awards and milestones
+  "record", "club-record", "record fee", "record breaker", "award", "awards", "ballon d'or",
+  "golden boot", "shortlisted", "nominee", "wins award", "named player of the year",
+  "100th appearance", "milestone", "century of", "all-time top",
+  // Retirement, farewells and returns
+  "retires", "retirement", "hangs up his boots", "calls time on", "farewell", "testimonial",
+  "returns to the club", "rejoins", "club legend",
+  // International selections
+  "called up", "call-up", "named in the squad", "squad announced", "earns first cap",
+  "senior debut", "caps",
+  // Ownership, finance and legal
+  "takeover", "takeover completed", "ownership", "new owner", "acquisition", "consortium",
+  "administration", "winding-up", "financial fair play", "profit and sustainability",
+  "breach", "lawsuit", "court", "tribunal", "legal action", "sues", "settles",
+  // Deadline day and windows
+  "deadline day", "january window", "summer window",
+  // Youth and breakthrough
+  "academy graduate", "first-team debut", "promoted to the first team", "signs first pro",
+  "professional terms",
+  // Club statements
+  "statement", "club statement", "confirm in a statement",
 ];
 
-/** Reported-but-unconfirmed developments (negotiations, interest, rumours). */
+/**
+ * Reported-but-unconfirmed developments: interest, negotiations, bids,
+ * valuations, players offered around, clubs open to selling, takeover talk
+ * and every other transfer-rumour register.
+ */
 const MEDIUM_SIGNAL = [
-  "bid", "offer", "talks", "negotiations", "interest", "interested", "linked", "link",
-  "target", "targeting", "eyeing", "eyed", "monitoring", "considering", "weighs up",
-  "weighing up", "plot", "plotting", "plots", "poised", "set to", "in advanced talks",
-  "make a move", "move for", "swoop", "race for", "chase", "chasing", "tracking",
-  "scouting", "scouted", "rumour", "rumor", "rumoured", "rumored", "reportedly",
-  "keen on", "mulls", "hopes to", "wants to sign", "approach", "enquiries", "enquiry",
+  "bid", "bids", "offer", "offers", "talks", "negotiations", "negotiating", "interest",
+  "interested", "linked", "link", "target", "targeting", "eyeing", "eyed", "monitoring",
+  "considering", "weighs up", "weighing up", "plot", "plotting", "plots", "poised",
+  "set to", "in advanced talks", "advanced negotiations", "make a move", "move for",
+  "swoop", "race for", "chase", "chasing", "tracking", "scouting", "scouted", "rumour",
+  "rumour", "rumor", "rumours", "rumors", "rumoured", "rumored", "reportedly",
+  "keen on", "mulls", "hopes to", "wants to sign", "approach", "approaches", "enquiries",
+  "enquiry", "contacts", "verbal agreement",
+  // Players offered, wanting to leave, available
+  "offered to", "offered around", "available for transfer", "on the market",
+  "open to a move", "open to leaving", "wants to leave", "wants out", "seeking a move",
+  "pushing for a move", "requesting a transfer", "transfer request", "attracting interest",
+  // Selling-club signals
+  "willing to sell", "prepared to sell", "willing to listen", "open to offers",
+  // Valuations and fees
+  "valuation", "valued at", "asking price", "price tag", "worth", "quoted", "fee agreed",
+  "add-ons", "add-ons included", "sell-on clause", "release clause", "buy-back clause",
+  "option to buy", "obligation to buy", "loan with option", "loan-to-buy",
+  // Agents and intermediaries
+  "agent", "agent says", "representative", "intermediary", "changes agent",
+  // Takeover and ownership talk
+  "takeover talk", "takeover rumours", "bidders", "in talks to buy", "considering a bid",
+  // Behind the scenes
+  "behind the scenes", "understanding", "understands", "exclusively", "exclusive",
 ];
-
-/** General football-news engagement signals (quotes, context, drama). */
+/**
+ * General football-news signals: match coverage, line-ups, quotes,
+ * dressing-room and training-ground reporting, tactics, stats, controversy
+ * and fan-facing context.
+ */
 const GENERAL_SIGNAL = [
-  "says", "admits", "insists", "reveals", "claims", "hits out", "slams", "backs",
+  // Quotes, interviews and press conferences
+  "says", "said", "admits", "insists", "reveals", "claims", "hits out", "slams", "backs",
   "praises", "warns", "vows", "refuses", "demands", "hints", "opens up", "speaks out",
-  "wants", "deal", "contract", "clause", "million", "billion", "€", "£", "exclusive",
-  "injury", "injured", "fitness", "doubt", "returns", "comeback", "final", "derby",
-  "clash", "showdown", "title race", "relegation battle", "sacking", "exit", "future",
-  "uncertain", "row", "rift", "bust-up", "bolt", "shock",
+  "press conference", "interview", "told", "responds", "message", "honest", "explains",
+  "exclusive interview", "in his own words", "speaking after",
+  // Match coverage
+  "win", "wins", "beat", "beats", "draw", "draws", "victory", "defeat", "loss", "thrash",
+  "thrashes", "rout", "comeback", "late winner", "stoppage time", "injury time",
+  "hat-trick", "brace", "goal", "goals", "assist", "assists", "clean sheet",
+  "match report", "player ratings", "rated", "man of the match", "post-match", "reaction",
+  "reacts", "full-time", "half-time", "aggregate", "tie", "fixture", "matchday",
+  // Line-ups, team news and previews
+  "starting xi", "starting line-up", "line-up", "lineup", "team news", "named in",
+  "bench", "starts", "predicted xi", "predicted line-up", "preview", "expected to start",
+  "in contention", "available for", "fit again",
+  // Tactics
+  "formation", "system", "tactical", "tactics", "change of shape", "role change",
+  // Dressing room and training ground
+  "dressing room", "dressing-room", "training ground", "training", "session", "argument",
+  "heated", "exchange", "confrontation", "unhappy", "frustrated", "at odds", "tension",
+  "disagreement", "fallen out", "clashed", "dispute", "row", "rift", "bust-up",
+  // VAR, referees and controversy
+  "var", "referee", "officials", "decision", "controversy", "controversial", "outrage",
+  "apology", "apologises", "mistake", "error",
+  // Fans, rivalry and derby
+  "fans", "supporters", "rivalry", "derby", "clash", "showdown", "title race",
+  "relegation battle", "bolt", "shock",
+  // Contracts, fees and finances
+  "wants", "deal", "contract", "clause", "million", "billion", "\u20ac", "\u00a3",
+  "wages", "salary", "contract situation", "future", "uncertain", "exit", "sacking",
+  // Youth and scouting
+  "wonderkid", "wonder kid", "youngster", "teenage", "breakthrough", "starlet", "prodigy",
+  "scouted", "youth", "academy", "talent",
+  // Stats and records
+  "stat", "stats", "in appearances", "goal involvement", "record signing",
+  // Injury context
+  "injury", "injured", "fitness", "doubt", "returns", "comeback", "sidelined",
 ];
-
 /** Patterns that make a headline a rumour / unconfirmed report rather than fact. */
 const RUMOUR_PATTERN =
-  /\b(rumou?rs?|rumou?red|reportedly|linked|interest(?:ed|s)?\b|eye(?:ing|d)\b|targets?(?:ing)?\b|considering|monitoring|plots?(?:ing)?\b|weigh(?:s|ing)? up|poised|set to\b|in talks|talks (?:with|over|to)|keen on|mulls|make a move|move for|swoop|race for|chasing?|tracking|scout(?:ing|ed)|approach(?:ed)?|could join|could sign|could move|prepar(?:es|ing) (?:a )?bid|hopes to|expected to)\b/i;
+  /\b(rumou?rs?|rumou?red|reportedly|report(?:s)? claim|according to reports|linked|interest(?:ed|s)?\b|eye(?:ing|d)\b|targets?(?:ing)?\b|considering|monitoring|plots?(?:ing)?\b|plans? to\b|plans? (?:to sign|a move|a bid|a deal)|weigh(?:s|ing)? up|poised|set to\b|in talks|talks (?:with|over|to)|keen on|mulls|make a move|move for|swoop|race for|chasing?|tracking|scout(?:ing|ed)|approach(?:ed)?|could join|could sign|could move|prepar(?:es|ing) (?:a )?bid|hopes to|expected to)\b/i;
 
 /** Patterns that mark a headline as low-value for a breaking-news page. */
 const LOW_VALUE_PATTERN =
-  /\b(odds|betting|tips?|predictions?|fantasy|how to watch|where to watch|tv channel|live stream|kick-?off time|what time|quiz|ranked|power rankings|best xi|combined xi|all-time xi|5 things|five things|ten things|top 10|in pictures|photos?:|watch:|video:|gift guide|black friday|deal of the day)\b/i;
+  /\b(odds|betting|tips?|fantasy|how to watch|where to watch|tv channel|live stream|kick-?off time|what time|quiz|ranked|power rankings|best xi|combined xi|all-time xi|5 things|five things|ten things|top 10|in pictures|photos?:|watch:|video:|gift guide|black friday|deal of the day)\b/i;
+
+/**
+ * Aggregation digests: a gossip column or rumour round-up bundles many
+ * unrelated claims from many publishers, so it cannot be published as ONE
+ * story with a single accurate source attribution. Individual rumours from
+ * the same publishers are still published — only the digest form is
+ * rejected. Specific deadline-day coverage is unaffected.
+ */
+const AGGREGATE_DIGEST_PATTERN =
+  /\b(gossip column|gossip of the day|gossip round-?up|rumou?r round-?up|rumou?r mill|today'?s rumou?rs|transfer round-?up|paper talk|back-?page round-?up|morning headlines|everything you need to know today)\b/i;
 
 /** Sources ordered by credibility. Matching is on normalized lower-case containment. */
 const TOP_TIER_SOURCES = [
@@ -291,6 +400,9 @@ export function evaluateArticle(
   if (LOW_VALUE_PATTERN.test(titleLower) || LOW_VALUE_PATTERN.test(description.toLowerCase())) {
     return reject("low-value content (betting, broadcast info, listicle or promotional)");
   }
+  if (AGGREGATE_DIGEST_PATTERN.test(titleLower) || AGGREGATE_DIGEST_PATTERN.test(description.toLowerCase())) {
+    return reject("aggregation digest: many claims from many publishers, no single attributable story");
+  }
 
   // --- Football gate -------------------------------------------------
   // Football is recognised three ways: explicit vocabulary, named football
@@ -359,8 +471,12 @@ export function evaluateArticle(
   score += Math.min(generalHits * 4, 12);
 
   const isRumour = classifyAsRumour(title);
-  if (isRumour && credibility !== "top") {
-    score -= 4; // unconfirmed reports from weaker sources need stronger signals
+  // Rumours are core football-news content and are never penalised for being
+  // rumours. Only unconfirmed reports from weak or unknown sources are held
+  // to a slightly higher standard, so aggregation-only blogs do not outrank
+  // established reporters.
+  if (isRumour && (credibility === "unknown" || credibility === "tabloid")) {
+    score -= 4;
   }
 
   if (score < RELEVANCE_THRESHOLD) {
@@ -508,7 +624,7 @@ function ageReason(ageHours: number | null): string {
   return `${Math.round(ageHours)}h old`;
 }
 
-function rateSource(sourceName: string | null, sourceId: string | null): SourceCredibility {
+export function rateSource(sourceName: string | null, sourceId: string | null): SourceCredibility {
   const haystacks = [sourceName, sourceId]
     .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
     .map((v) => v.toLowerCase().replace(/[^a-z0-9' .-]/g, " ").replace(/\s+/g, " ").trim());
@@ -524,11 +640,17 @@ function rateSource(sourceName: string | null, sourceId: string | null): SourceC
 function countHits(haystack: string, terms: string[]): number {
   let hits = 0;
   for (const term of terms) {
-    if (term.includes(" ") || term.includes("-") || term.length <= 3 || /[^a-z0-9]/.test(term)) {
-      if (haystack.includes(term)) hits += 1;
-    } else {
-      const pattern = new RegExp(`\\b${escapeRegExp(term)}`, "i");
-      if (pattern.test(haystack)) hits += 1;
+    // A single alphanumeric word must match on a word boundary. Substring
+    // matching here caused real false positives: "nfl" matched inside
+    // "conflict" and "var" inside "variety", wrongly rejecting football
+    // stories as being about another sport.
+    const isSingleWord = /^[a-z0-9]+$/i.test(term);
+    if (isSingleWord) {
+      if (new RegExp(`\\b${escapeRegExp(term)}`, "i").test(haystack)) hits += 1;
+    } else if (haystack.includes(term)) {
+      // Multi-word phrases and terms with punctuation/symbols ("ballon d'or",
+      // "ligue 1", "\u20ac") match literally.
+      hits += 1;
     }
   }
   return hits;

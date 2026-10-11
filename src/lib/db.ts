@@ -268,17 +268,21 @@ async function createSchema(): Promise<void> {
     )
   `;
 
-  // Publishing governor: daily caps and the persistent cooldown.
+  // Publishing pacing: NO daily cap is stored here. `posts_total` is a
+  // monitoring counter only; `next_eligible_publish_at` holds the short,
+  // non-blocking spacing interval between ordinary posts.
   await sql`
     CREATE TABLE IF NOT EXISTS publish_state (
       day text PRIMARY KEY,
-      ordinary_posts integer NOT NULL DEFAULT 0,
-      emergency_posts integer NOT NULL DEFAULT 0,
+      posts_total integer NOT NULL DEFAULT 0,
       next_eligible_publish_at timestamptz,
       last_published_at timestamptz,
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `;
+  // Installations created before caps were removed keep their old columns;
+  // the new counter is added alongside them without data loss.
+  await sql`ALTER TABLE publish_state ADD COLUMN IF NOT EXISTS posts_total integer NOT NULL DEFAULT 0`;
 
   await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS stale_not_new integer NOT NULL DEFAULT 0`;
   await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS publish_skipped_reason text`;
