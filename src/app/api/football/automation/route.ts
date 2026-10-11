@@ -10,7 +10,7 @@ import { runAutomation } from "@/lib/automation";
  *   - Auth: "Authorization: Bearer <CRON_SECRET>" header
  *
  * Manual runs and cron retries use this exact same endpoint, so every
- * execution path shares the same Neon-backed NewsData.io request counter
+ * execution path shares the same Neon-backed flood control and claims
  * and the same duplicate protection. There is no query-string secret and
  * no unauthenticated trigger anywhere in the application.
  */
