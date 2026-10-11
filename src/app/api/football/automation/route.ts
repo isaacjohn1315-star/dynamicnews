@@ -6,7 +6,7 @@ import { runAutomation } from "@/lib/automation";
  *
  * Contract with cron-job.org (unchanged):
  *   - URL: /api/football/automation
- *   - Schedule: every 8 minutes
+ *   - Schedule: every 10 minutes
  *   - Auth: "Authorization: Bearer <CRON_SECRET>" header
  *
  * Manual runs and cron retries use this exact same endpoint, so every
