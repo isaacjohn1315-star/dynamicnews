@@ -8,6 +8,7 @@ import {
   Database,
   Flag,
   Funnel,
+  Flame,
   Gauge,
   GitBranch,
   KeyRound,
@@ -43,6 +44,9 @@ export const revalidate = 0;
 
 export default async function DashboardPage() {
   const [data, tokenHealth] = await Promise.all([getDashboardData(), checkPageTokenHealth()]);
+  // Derived from the data layer's own server timestamp rather than a clock
+  // read during render, so this component stays pure.
+  const renderedAt = data ? Date.parse(data.generatedAt) : 0;
   const config = configPresence();
 
   return (
@@ -76,11 +80,11 @@ export default async function DashboardPage() {
 
             <section className="mt-4 grid gap-4 lg:grid-cols-5">
               <PublishedCard posts={data.recentPublished} />
-              <FeedsCard feeds={data.feeds} summary={data.feedSummary} />
+              <FeedsCard feeds={data.feeds} summary={data.feedSummary} registry={data.registry} batches={data.batches} />
             </section>
 
             <section className="mt-4 grid gap-4 lg:grid-cols-5">
-              <ContinuousCard runsToday={data.totals.runsToday} lastRun={data.lastRun} lastSuccessfulRun={data.lastSuccessfulRun} scan={data.scan} publish={data.publish} />
+              <ContinuousCard now={renderedAt} runsToday={data.totals.runsToday} lastRun={data.lastRun} lastSuccessfulRun={data.lastSuccessfulRun} scan={data.scan} publish={data.publish} />
               <DuplicateShieldCard totals={data.totals} />
             </section>
 
@@ -324,6 +328,7 @@ function KpiGrid({ totals, publish }: { totals: DashboardData["totals"]; publish
       <Kpi icon={<Funnel className="h-4 w-4" />} label="Filtered out" value={totals.rejected} sub={`${formatInteger(totals.rejectedStale)} stale · rest irrelevant`} tone="zinc" />
       <Kpi icon={<TriangleAlert className="h-4 w-4" />} label="Failed posts" value={totals.failed} sub="retry-safe, never lost" tone="red" />
       <Kpi icon={<GitBranch className="h-4 w-4" />} label="Follow-ups posted" value={totals.followups} sub="materially new developments" tone="amber" />
+      <Kpi icon={<Flame className="h-4 w-4" />} label="Trending tracked" value={totals.trending} sub="2-7 days, multi-publisher" tone="cyan" />
     </div>
   );
 }
@@ -334,6 +339,7 @@ const KPI_TONES: Record<string, string> = {
   violet: "text-violet-300 border-violet-300/20 bg-violet-300/[0.06]",
   red: "text-red-300 border-red-300/20 bg-red-300/[0.06]",
   amber: "text-amber-300 border-amber-300/20 bg-amber-300/[0.06]",
+  cyan: "text-cyan-300 border-cyan-300/20 bg-cyan-300/[0.06]",
   zinc: "text-zinc-300 border-white/10 bg-white/[0.04]",
 };
 
@@ -440,6 +446,11 @@ function StoriesCard({ stories }: { stories: DashboardStory[] }) {
             <li key={story.id} className="flex items-start justify-between gap-4 py-2.5 first:pt-0 last:pb-0">
               <div className="min-w-0">
                 <p className="truncate text-sm text-zinc-200" title={story.title}>
+                  {story.freshnessCategory === "trending" && (
+                    <span className="mr-1.5 rounded bg-cyan-300/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-cyan-200">
+                      Trending
+                    </span>
+                  )}
                   {story.isFollowup && (
                     <span className="mr-1.5 rounded bg-amber-300/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-200">
                       Follow-up
@@ -464,12 +475,19 @@ function StoriesCard({ stories }: { stories: DashboardStory[] }) {
                   {story.storyStage && story.storyStage !== "general" && (
                     <span title="Reported stage of the underlying story">· {story.storyStage}</span>
                   )}
-                  {story.ageMinutesAtDiscovery !== null && (
-                    <span title="Age of the article when DynaSport first saw it">
-                      · {story.ageMinutesAtDiscovery}m old at discovery
+                  {story.publishedAt && (
+                    <span title="The publisher's original publication time (UTC)">
+                      · published {timeAgo(story.publishedAt)}
                     </span>
                   )}
-                  <span>· {timeAgo(story.createdAt)}</span>
+                  {story.firstSeenAt && (
+                    <span title="When DynaSport first discovered this article (UTC)">
+                      · discovered {timeAgo(story.firstSeenAt)}
+                    </span>
+                  )}
+                  {story.freshnessCategory && (
+                    <span>· {story.freshnessCategory}</span>
+                  )}
                 </p>
                 {story.status === "duplicate" && (
                   <p className="mt-0.5 text-[11px] text-violet-300/70">
@@ -557,7 +575,7 @@ function PublishedCard({ posts }: { posts: DashboardStory[] }) {
               )}
               <p className="mt-1.5 text-[11px] text-zinc-400">Source: {post.sourceName ?? "unknown"}</p>
               <p className="mt-1 font-mono text-[10px] tabular-nums text-zinc-600">
-                {timeAgo(post.postedAt)} · {post.fbPostId ?? ""}
+                posted {timeAgo(post.postedAt)} · published {timeAgo(post.publishedAt)} · {post.fbPostId ?? ""}
               </p>
             </li>
           ))}
@@ -571,17 +589,26 @@ const FEED_STATUS_STYLES: Record<string, { cls: string; label: string }> = {
   ok: { cls: "border-lime-300/25 bg-lime-300/10 text-lime-200", label: "ok" },
   not_modified: { cls: "border-zinc-400/20 bg-white/[0.04] text-zinc-300", label: "unchanged" },
   untested: { cls: "border-white/10 bg-white/[0.03] text-zinc-500", label: "untested" },
+  rate_limited: { cls: "border-amber-300/25 bg-amber-300/10 text-amber-200", label: "rate limited" },
+  blocked: { cls: "border-red-300/25 bg-red-300/10 text-red-200", label: "blocked" },
   error: { cls: "border-red-300/25 bg-red-300/10 text-red-200", label: "error" },
   skipped_backoff: { cls: "border-amber-300/25 bg-amber-300/10 text-amber-200", label: "backoff" },
 };
 
-function FeedsCard({ feeds, summary }: { feeds: DashboardFeed[]; summary: DashboardData["feedSummary"] }) {
+function FeedsCard({
+  feeds, summary, registry, batches,
+}: {
+  feeds: DashboardFeed[];
+  summary: DashboardData["feedSummary"];
+  registry: DashboardData["registry"];
+  batches: DashboardData["batches"];
+}) {
   return (
     <Card className="lg:col-span-3">
-      <SectionLabel icon={<Rss className="h-3.5 w-3.5" />}>News sources & feed health</SectionLabel>
+      <SectionLabel icon={<Rss className="h-3.5 w-3.5" />}>Feed registry & health</SectionLabel>
       <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
-        {formatInteger(summary.catalogue)} validated public football feeds — conditional requests, rotation and
-        automatic backoff. RSS costs zero NewsData.io credits and is the primary publishing source.
+        {formatInteger(registry.total)} of {formatInteger(registry.capacity)} feed capacity registered. Each run
+        claims a bounded batch of due feeds; untested feeds stay untested until a real fetch verifies them.
       </p>
       <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-semibold uppercase tracking-wider">
         <span className="rounded-full border border-lime-300/25 bg-lime-300/10 px-2 py-0.5 text-lime-200">
@@ -597,6 +624,24 @@ function FeedsCard({ feeds, summary }: { feeds: DashboardFeed[]; summary: Dashbo
           {formatInteger(summary.backoff)} backoff
         </span>
       </div>
+      <dl className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {[
+          ["Checked / 1h", formatInteger(registry.checkedLastHour)],
+          ["Checked / 24h", formatInteger(registry.checkedLast24h)],
+          ["Avg fetch", registry.avgFetchMs === null ? "—" : `${registry.avgFetchMs} ms`],
+          ["Failure rate", `${registry.failureRatePct}%`],
+          ["Rate limited", formatInteger(registry.rateLimited)],
+          ["Last batch", batches.lastProcessed > 0 ? `${formatInteger(batches.lastProcessed)} feeds` : "—"],
+          ["Batch articles", formatInteger(batches.lastArticles)],
+          ["Batches running", formatInteger(batches.running)],
+        ].map(([label, value]) => (
+          <div key={label} className="rounded-lg border border-white/[0.06] bg-black/30 px-3 py-2">
+            <dt className="text-[10px] uppercase tracking-wider text-zinc-500">{label}</dt>
+            <dd className="mt-0.5 font-mono text-sm tabular-nums text-zinc-200">{value}</dd>
+          </div>
+        ))}
+      </dl>
+
       {feeds.length === 0 ? (
         <EmptyState text="Feeds register automatically on the next automation run." />
       ) : (
@@ -612,7 +657,8 @@ function FeedsCard({ feeds, summary }: { feeds: DashboardFeed[]; summary: Dashbo
                 <div className="min-w-0">
                   <p className="truncate text-xs font-medium text-zinc-200">{feed.name}</p>
                   <p className="mt-0.5 truncate font-mono text-[10px] text-zinc-600" title={feed.url}>
-                    {hostOf(feed.url)}{feed.topic ? ` · ${feed.topic}` : ""} · {feed.itemsSeen} items
+                    {hostOf(feed.url)} · P{feed.priority || 2} · every {feed.pollIntervalMinutes || 60}m · {feed.itemsSeen} items
+                    {feed.nextCheckAt ? ` · next ${timeAgo(feed.nextCheckAt)}` : ""}
                     {feed.lastFetchedAt ? ` · ${timeAgo(feed.lastFetchedAt)}` : " · not fetched yet"}
                     {feed.consecutiveFailures > 0 ? ` · ${feed.consecutiveFailures} failures` : ""}
                   </p>
@@ -731,18 +777,20 @@ function PipelineCard({ lastRun, feedCount }: { lastRun: DashboardRun | null; fe
 const EXPECTED_RUNS_PER_DAY = 144;
 
 function ContinuousCard({
-  runsToday, lastRun, lastSuccessfulRun, scan, publish,
+  now, runsToday, lastRun, lastSuccessfulRun, scan, publish,
 }: {
+  /** Server render time, passed in so render stays pure. */
+  now: number;
   runsToday: number;
   lastRun: DashboardRun | null;
   lastSuccessfulRun: DashboardRun | null;
   scan: DashboardData["scan"];
   publish: DashboardData["publish"];
 }) {
-  const elapsedMinutes = Math.floor((Date.now() - Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`)) / 60000);
+  const elapsedMinutes = Math.floor((now - Date.parse(`${new Date(now).toISOString().slice(0, 10)}T00:00:00Z`)) / 60000);
   const expectedSoFar = Math.max(1, Math.floor(elapsedMinutes / 10));
   const coverage = Math.min(100, Math.round((runsToday / expectedSoFar) * 100));
-  const minutesSinceLast = lastRun ? Math.floor((Date.now() - Date.parse(lastRun.startedAt)) / 60000) : null;
+  const minutesSinceLast = lastRun ? Math.floor((now - Date.parse(lastRun.startedAt)) / 60000) : null;
   const healthy = minutesSinceLast !== null && minutesSinceLast <= 25;
 
   return (
@@ -784,7 +832,7 @@ function ContinuousCard({
         <div className="flex items-center justify-between gap-2">
           <dt className="text-zinc-500">Next post eligible</dt>
           <dd className="font-mono tabular-nums text-zinc-300">
-            {publish.nextEligibleAt && Date.parse(publish.nextEligibleAt) > Date.now()
+            {publish.nextEligibleAt && Date.parse(publish.nextEligibleAt) > now
               ? `${formatDateTime(publish.nextEligibleAt)} UTC`
               : "now"}
           </dd>
