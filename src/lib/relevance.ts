@@ -3,7 +3,7 @@ import { cleanText } from "./text";
 /**
  * DynaSport relevance engine.
  *
- * Decides which NewsData.io articles are important enough to publish to the
+ * Decides which discovered articles are important enough to publish to the
  * DynaSport Facebook Page, builds the concise news statement, and detects
  * cross-publisher duplicates of the same underlying story. Everything is
  * deterministic and explainable: each decision carries a reason string and
@@ -347,7 +347,7 @@ export function normalizeSourceName(article: {
 export function parsePubDate(value: string | null | undefined): Date | null {
   if (!value) return null;
   const trimmed = value.trim();
-  // NewsData.io uses "YYYY-MM-DD HH:MM:SS" (UTC). Normalize defensively.
+  // Some feeds use "YYYY-MM-DD HH:MM:SS" (UTC). Normalize defensively.
   const isoLike = trimmed.includes("T") ? trimmed : trimmed.replace(" ", "T") + "Z";
   const parsed = new Date(isoLike);
   return Number.isNaN(parsed.getTime()) ? null : parsed;

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { getConfig } from "./config";
 import { getDb, type RssFeedRow } from "./db";
 
 /**
@@ -25,10 +26,15 @@ import { getDb, type RssFeedRow } from "./db";
 /* Tunables                                                            */
 /* ------------------------------------------------------------------ */
 
-/** Feeds claimed per automation run. Bounded so a run always finishes. */
-export const BATCH_SIZE = 180;
-/** Global cap on simultaneous outbound feed requests. */
-export const GLOBAL_CONCURRENCY = 40;
+/** Feeds claimed per automation run (from FEED_BATCH_SIZE, default 180). */
+export function batchSize(): number {
+  return getConfig().feedBatchSize;
+}
+
+/** Global cap on simultaneous outbound feed requests (FEED_CONCURRENCY). */
+export function globalConcurrency(): number {
+  return getConfig().feedConcurrency;
+}
 /** Simultaneous requests allowed to a single publisher domain. */
 export const PER_DOMAIN_CONCURRENCY = 2;
 /** Minimum spacing between two requests to the same domain, in ms. */
@@ -174,7 +180,7 @@ export interface BatchClaim {
  * Randomised tie-breaking spreads requests across publishers instead of
  * hammering one domain whose feeds all became due together.
  */
-export async function claimFeedBatch(limit: number = BATCH_SIZE): Promise<BatchClaim> {
+export async function claimFeedBatch(limit: number = batchSize()): Promise<BatchClaim> {
   const sql = getDb();
   const workerId = randomUUID();
 

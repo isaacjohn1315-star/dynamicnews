@@ -37,6 +37,12 @@ const MAX_FETCHES_PER_RUN = 12;
 export interface ArticleContent {
   url: string;
   text: string | null;
+  /**
+   * Raw HTML head/body of the fetched page, retained in memory only for
+   * this run so og:image can be read from the SAME request — never a
+   * second download, and never persisted.
+   */
+  html: string | null;
   /** Why content is unavailable, when it is. */
   reason: string | null;
   fetched: boolean;
@@ -126,7 +132,7 @@ async function respectCrawlDelay(origin: string, delayMs: number): Promise<void>
  * `{ text: null, reason }` rather than throwing when content is unavailable.
  */
 export async function fetchArticleContent(url: string): Promise<ArticleContent> {
-  const fail = (reason: string): ArticleContent => ({ url, text: null, reason, fetched: false });
+  const fail = (reason: string): ArticleContent => ({ url, text: null, html: null, reason, fetched: false });
 
   if (fetchesThisRun >= MAX_FETCHES_PER_RUN) return fail("article fetch budget for this run is exhausted");
 
@@ -146,7 +152,7 @@ export async function fetchArticleContent(url: string): Promise<ArticleContent> 
 
   // Already fetched and cached in Neon? Never download it twice.
   const cached = await readCachedArticle(url);
-  if (cached !== null) return { url, text: cached, reason: null, fetched: true };
+  if (cached !== null) return { url, text: cached, html: null, reason: null, fetched: true };
 
   await respectCrawlDelay(origin, robots.crawlDelayMs);
 
@@ -201,7 +207,14 @@ export async function fetchArticleContent(url: string): Promise<ArticleContent> 
   if (!text || text.length < 200) return fail("no readable article text found");
 
   await writeCachedArticle(url, text);
-  return { url, text: text.slice(0, MAX_TEXT_CHARS), reason: null, fetched: true };
+  return {
+    url,
+    text: text.slice(0, MAX_TEXT_CHARS),
+    // Only the head region is kept: enough for og:image/twitter:image.
+    html: html.slice(0, 200_000),
+    reason: null,
+    fetched: true,
+  };
 }
 
 /* ------------------------------------------------------------------ */

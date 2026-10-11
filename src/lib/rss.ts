@@ -7,7 +7,7 @@ import {
   DomainLimiter,
   domainOf,
   finishBatch,
-  GLOBAL_CONCURRENCY,
+  globalConcurrency,
   interleaveByDomain,
   isSafeFeedUrl,
   MAX_FEED_BYTES,
@@ -15,14 +15,14 @@ import {
   releaseClaims,
   type ClaimedFeed,
 } from "./feed-registry";
+import { imageCandidatesFromFeedItem, type ImageCandidate } from "./image";
 import { cleanText } from "./text";
 
 /**
  * RSS/Atom football-news discovery (server-only).
  *
- * Feeds are the PRIMARY publishing source: they are fetched directly from
- * publishers at zero NewsData.io credit cost and deliver items far fresher
- * than the NewsData free plan (which can lag ~12 hours).
+ * Feeds are the ONLY discovery source: they are fetched directly from
+ * publishers, with no third-party API budget or request ceiling.
  *
  * Every feed in `FEED_CATALOGUE` was validated with a real HTTP request
  * before inclusion (HTTP 200, parseable RSS/Atom, >= 3 items, usable
@@ -67,6 +67,8 @@ export interface RssArticle {
   publishedAt: Date | null;
   guid: string | null;
   dedupeKey: string;
+  /** Image URLs advertised by the feed itself, in priority order. */
+  imageCandidates: ImageCandidate[];
 }
 
 export interface FeedOutcome {
@@ -134,7 +136,7 @@ export async function fetchRssFeeds(deadline?: number, batchSize?: number): Prom
   let rateLimited = 0;
 
   // Fixed-size worker pool: never an unbounded Promise.all over 50k feeds.
-  const workerCount = Math.min(GLOBAL_CONCURRENCY, ordered.length);
+  const workerCount = Math.min(globalConcurrency(), ordered.length);
   const workers = Array.from({ length: workerCount }, async () => {
     for (;;) {
       if (deadline !== undefined && Date.now() >= deadline) return;
@@ -357,6 +359,7 @@ function parseFeed(xml: string, feedName: string): RssArticle[] {
         publishedAt: parseDate(textOf(record.pubDate) ?? textOf(record.date) ?? textOf(record.published)),
         guid: textOf(record.guid) ?? textOf(record.id),
         sourceOverride: textOf(record.source),
+        imageCandidates: imageCandidatesFromFeedItem(record, feedName),
       });
     }
     return items;
@@ -374,6 +377,7 @@ function parseFeed(xml: string, feedName: string): RssArticle[] {
         publishedAt: parseDate(textOf(record.published) ?? textOf(record.updated)),
         guid: textOf(record.id),
         sourceOverride: null,
+        imageCandidates: imageCandidatesFromFeedItem(record, feedName),
       });
     }
   }
@@ -391,6 +395,7 @@ function pushItem(
     publishedAt: Date | null;
     guid: string | null;
     sourceOverride: string | null;
+    imageCandidates: ImageCandidate[];
   },
 ): void {
   // Clean BEFORE anything else: scoring, storage and posting all use this.
@@ -422,6 +427,7 @@ function pushItem(
     publishedAt: item.publishedAt,
     guid: clean(item.guid),
     dedupeKey,
+    imageCandidates: item.imageCandidates ?? [],
   });
 }
 

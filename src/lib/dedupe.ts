@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 /**
- * Shared deduplication helpers used by every news provider (NewsData.io,
+ * Shared deduplication helpers used by every news provider
  * RSS feeds). One canonical implementation — no duplicate provider logic.
  */
 
@@ -39,7 +39,7 @@ export function normalizeText(value: string): string {
  * fingerprint of title + source + publication time.
  */
 export function buildArticleDedupeKey(parts: {
-  provider: "newsdata" | "rss";
+  provider: string;
   providerArticleId?: string | null;
   url?: string | null;
   title?: string | null;

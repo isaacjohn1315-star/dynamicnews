@@ -1,6 +1,8 @@
+import { getConfig, runsPerDay } from "./config";
 import { dbTransport, ensureSchema, getDb, type SqlClient } from "./db";
-import { getBudgetStats } from "./request-budget";
 import { getPublishState, type PublishState } from "./publishing";
+import { checkFloodControl, maxPostsPerHour, minSpacingMinutes, popularityMinScore } from "./flood";
+import { getLastQueueReset } from "./queue";
 import { getScanState } from "./freshness";
 import { FEED_COUNT } from "./feeds";
 import { getRegistryStats, type RegistryStats } from "./feed-registry";
@@ -16,8 +18,7 @@ export interface DashboardRun {
   startedAt: string;
   finishedAt: string | null;
   status: string;
-  newsdataRequests: number;
-  budgetUsedToday: number | null;
+
   fetched: number;
   newCandidates: number;
   rejected: number;
@@ -42,7 +43,7 @@ export interface DashboardStory {
   id: string;
   title: string;
   sourceName: string | null;
-  provider: "newsdata" | "rss";
+  provider: string;
   feedName: string | null;
   status: string;
   relevanceScore: number;
@@ -65,6 +66,12 @@ export interface DashboardStory {
   publishedAt: string | null;
   postedAt: string | null;
   fbPostId: string | null;
+  imageStatus: string | null;
+  imageError: string | null;
+  imageOrigin: string | null;
+  publishMode: string | null;
+  fallbackReason: string | null;
+  fbPhotoId: string | null;
 }
 
 export interface DashboardFeed {
@@ -102,6 +109,15 @@ export interface DashboardData {
     shown: number;
   };
   registry: RegistryStats;
+  queueReset: Awaited<ReturnType<typeof getLastQueueReset>>;
+  flood: {
+    maxPerHour: number;
+    minSpacingMinutes: number;
+    popularityMinScore: number;
+    postsLastHour: number;
+    minutesSinceLastPost: number | null;
+    nextEligibleAt: string | null;
+  };
   batches: {
     lastFinishedAt: string | null;
     lastProcessed: number;
@@ -109,19 +125,10 @@ export interface DashboardData {
     lastAvgFetchMs: number | null;
     running: number;
   };
-  budget: {
-    day: string;
-    used: number;
-    limit: number;
-    remaining: number;
-    rolling24h: number;
-    limitReachedAt: string | null;
-    resetsAt: string;
-  };
-  newsdataHealth: {
-    lastSuccessAt: string | null;
-    lastFailureAt: string | null;
-    lastFailureError: string | null;
+  /** Cron capacity, from configuration rather than any hardcoded number. */
+  cron: {
+    intervalMinutes: number;
+    runsPerDay: number;
   };
   totals: {
     publishedToday: number;
@@ -136,6 +143,14 @@ export interface DashboardData {
     trending: number;
     failed: number;
     awaitingRetry: number;
+    expired: number;
+    cancelled: number;
+    superseded: number;
+    withPhoto: number;
+    textOnly: number;
+    imageValidated: number;
+    imageRejected: number;
+    imageNone: number;
     runsToday: number;
   };
   publish: PublishState;
@@ -157,7 +172,6 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     await ensureSchema();
     const sql = getDb();
 
-    const budget = await getBudgetStats();
 
     const totalsRows = (await sql`
       SELECT
@@ -174,7 +188,15 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         COUNT(*) FILTER (WHERE is_followup = true AND status = 'published')::int AS followups,
         COUNT(*) FILTER (WHERE freshness_category = 'trending')::int AS trending,
         COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
-        COUNT(*) FILTER (WHERE status = 'candidate' AND attempts > 0)::int AS awaiting_retry
+        COUNT(*) FILTER (WHERE status = 'candidate' AND attempts > 0)::int AS awaiting_retry,
+        COUNT(*) FILTER (WHERE status = 'expired')::int AS expired,
+        COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+        COUNT(*) FILTER (WHERE status = 'superseded')::int AS superseded,
+        COUNT(*) FILTER (WHERE publish_mode = 'photo')::int AS with_photo,
+        COUNT(*) FILTER (WHERE publish_mode IN ('text','text_fallback'))::int AS text_only,
+        COUNT(*) FILTER (WHERE image_status IN ('validated','published_with_image'))::int AS image_validated,
+        COUNT(*) FILTER (WHERE image_status IN ('download_failed','validation_failed','unsupported_format','too_large','blocked_unsafe'))::int AS image_rejected,
+        COUNT(*) FILTER (WHERE image_status = 'none_found')::int AS image_none
       FROM news_items
     `) as {
       published_today: number;
@@ -189,6 +211,14 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       trending: number;
       failed: number;
       awaiting_retry: number;
+      expired: number;
+      cancelled: number;
+      superseded: number;
+      with_photo: number;
+      text_only: number;
+      image_validated: number;
+      image_rejected: number;
+      image_none: number;
     }[];
 
     const runCountsRows = (await sql`
@@ -197,23 +227,10 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       WHERE started_at >= (CURRENT_DATE AT TIME ZONE 'UTC')
     `) as { runs_today: number }[];
 
-    const healthRows = (await sql`
-      SELECT
-        MAX(started_at) FILTER (
-          WHERE newsdata_requests = 1 AND discovery_error IS NULL
-        ) AS last_success_at,
-        MAX(started_at) FILTER (
-          WHERE newsdata_requests = 1 AND discovery_error IS NOT NULL
-        ) AS last_failure_at,
-        (SELECT discovery_error FROM automation_runs
-          WHERE newsdata_requests = 1 AND discovery_error IS NOT NULL
-          ORDER BY started_at DESC LIMIT 1) AS last_failure_error
-      FROM automation_runs
-    `) as { last_success_at: unknown; last_failure_at: unknown; last_failure_error: unknown }[];
 
     const runRows = (await sql`
-      SELECT id, started_at, finished_at, status, newsdata_requests,
-             budget_used_today, fetched, new_candidates, rejected,
+      SELECT id, started_at, finished_at, status,
+             fetched, new_candidates, rejected,
              duplicates_skipped, published, discovery_error, publish_error, error,
              feeds_checked, feeds_ok, rss_fetched, rss_new_candidates,
              exact_duplicates, story_duplicates, stale_rejected, followups_accepted,
@@ -228,7 +245,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
              corroborations, is_rumour, story_stage, is_followup, duplicate_kind,
              reject_kind, decision_reason, attempts, last_error, headline, explanation,
              age_minutes_at_discovery, freshness_category, next_retry_at, created_at,
-             published_at, first_seen_at, posted_at, fb_post_id
+             published_at, first_seen_at, posted_at, fb_post_id,
+             image_status, image_error, image_origin, publish_mode, fallback_reason, fb_photo_id
       FROM news_items
       ORDER BY created_at DESC
       LIMIT 18
@@ -239,7 +257,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
              corroborations, is_rumour, story_stage, is_followup, duplicate_kind,
              reject_kind, decision_reason, attempts, last_error, headline, explanation,
              age_minutes_at_discovery, freshness_category, next_retry_at, created_at,
-             published_at, first_seen_at, posted_at, fb_post_id
+             published_at, first_seen_at, posted_at, fb_post_id,
+             image_status, image_error, image_origin, publish_mode, fallback_reason, fb_photo_id
       FROM news_items
       WHERE status = 'published'
       ORDER BY posted_at DESC NULLS LAST
@@ -268,7 +287,11 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       FROM rss_feeds
     `) as { total: number; healthy: number; failing: number; untested: number; backoff: number }[];
 
-    const registry = await getRegistryStats();
+    const [registry, queueReset, floodState] = await Promise.all([
+      getRegistryStats(),
+      getLastQueueReset(),
+      checkFloodControl(),
+    ]);
     const batchRows = (await sql`
       SELECT started_at, finished_at, status, processed, articles, avg_fetch_ms
       FROM feed_batches ORDER BY started_at DESC LIMIT 5
@@ -282,8 +305,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     const publish = await getPublishState();
     const scan = await getScanState();
     const lastSuccessRows = (await sql`
-      SELECT id, started_at, finished_at, status, newsdata_requests,
-             budget_used_today, fetched, new_candidates, rejected,
+      SELECT id, started_at, finished_at, status,
+             fetched, new_candidates, rejected,
              duplicates_skipped, published, discovery_error, publish_error, error,
              feeds_checked, feeds_ok, rss_fetched, rss_new_candidates,
              exact_duplicates, story_duplicates, stale_rejected, followups_accepted,
@@ -307,27 +330,25 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       trending: 0,
       failed: 0,
       awaiting_retry: 0,
+      expired: 0,
+      cancelled: 0,
+      superseded: 0,
+      with_photo: 0,
+      text_only: 0,
+      image_validated: 0,
+      image_rejected: 0,
+      image_none: 0,
     };
 
     const recentRuns = runRows.map(toRun);
     const recentPublished = publishedRows.map(toStory);
-    const health = healthRows[0] ?? {
-      last_success_at: null,
-      last_failure_at: null,
-      last_failure_error: null,
-    };
 
     return {
       generatedAt: new Date().toISOString(),
       transport: dbTransport(),
-      budget,
-      newsdataHealth: {
-        lastSuccessAt: isoStringOrNull(health.last_success_at),
-        lastFailureAt: isoStringOrNull(health.last_failure_at),
-        lastFailureError:
-          typeof health.last_failure_error === "string" && health.last_failure_error.trim().length > 0
-            ? health.last_failure_error
-            : null,
+      cron: {
+        intervalMinutes: getConfig().cronIntervalMinutes,
+        runsPerDay: runsPerDay(),
       },
       totals: {
         publishedToday: totals.published_today,
@@ -342,6 +363,14 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         trending: totals.trending,
         failed: totals.failed,
         awaitingRetry: totals.awaiting_retry,
+        expired: totals.expired,
+        cancelled: totals.cancelled,
+        superseded: totals.superseded,
+        withPhoto: totals.with_photo,
+        textOnly: totals.text_only,
+        imageValidated: totals.image_validated,
+        imageRejected: totals.image_rejected,
+        imageNone: totals.image_none,
         runsToday: runCountsRows[0]?.runs_today ?? 0,
       },
       publish,
@@ -356,6 +385,15 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         shown: Math.min(feedRows.length, 60),
       },
       registry,
+      queueReset,
+      flood: {
+        maxPerHour: maxPostsPerHour(),
+        minSpacingMinutes: minSpacingMinutes(),
+        popularityMinScore: popularityMinScore(),
+        postsLastHour: floodState.postsLastHour,
+        minutesSinceLastPost: floodState.minutesSinceLastPost,
+        nextEligibleAt: floodState.nextEligibleAt,
+      },
       batches: {
         lastFinishedAt: isoStringOrNull(lastDone?.finished_at),
         lastProcessed: toNumber(lastDone?.processed),
@@ -382,8 +420,7 @@ function toRun(row: Record<string, unknown>): DashboardRun {
     startedAt: isoString(row.started_at),
     finishedAt: isoStringOrNull(row.finished_at),
     status: String(row.status ?? "unknown"),
-    newsdataRequests: toNumber(row.newsdata_requests),
-    budgetUsedToday: row.budget_used_today === null ? null : toNumber(row.budget_used_today),
+
     fetched: toNumber(row.fetched),
     newCandidates: toNumber(row.new_candidates),
     rejected: toNumber(row.rejected),
@@ -406,7 +443,7 @@ function toRun(row: Record<string, unknown>): DashboardRun {
 }
 
 function toStory(row: Record<string, unknown>): DashboardStory {
-  const provider = row.provider === "rss" ? "rss" : "newsdata";
+  const provider = String(row.provider ?? "rss");
   return {
     id: String(row.id),
     title: String(row.title ?? ""),
@@ -424,6 +461,12 @@ function toStory(row: Record<string, unknown>): DashboardStory {
     publishedAt: isoStringOrNull(row.published_at),
     firstSeenAt: isoStringOrNull(row.first_seen_at),
     freshnessCategory: stringOrNull(row.freshness_category),
+    imageStatus: stringOrNull(row.image_status),
+    imageError: stringOrNull(row.image_error),
+    imageOrigin: stringOrNull(row.image_origin),
+    publishMode: stringOrNull(row.publish_mode),
+    fallbackReason: stringOrNull(row.fallback_reason),
+    fbPhotoId: stringOrNull(row.fb_photo_id),
     isFollowup: row.is_followup === true,
     duplicateKind: stringOrNull(row.duplicate_kind),
     rejectKind: stringOrNull(row.reject_kind),

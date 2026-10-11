@@ -1,66 +1,73 @@
 import { randomUUID } from "node:crypto";
 import { ensureSchema, getDb, type NewsItemRow } from "./db";
+import { articleBudgetRemaining, fetchArticleContent, resetArticleBudget } from "./article";
+import { buildExplanation, composePost, finalQualityCheck } from "./compose";
 import {
-  buildFacebookPostText,
   FacebookPublishError,
   findRecentMatchingPost,
   isValidPostText,
+  postHashOf,
+  publishPhotoToFacebook,
   publishToFacebook,
+  releasePostHash,
 } from "./facebook";
-import { buildDedupeKey, fetchLatestFootballNews, type NewsDataArticle } from "./newsdata";
+import {
+  imageCandidatesFromHtml,
+  resolveImage,
+  type ImageCandidate,
+} from "./image";
+import {
+  computeLifecycle,
+  markInvalid,
+  sweepExpired,
+  validateBeforePublish,
+} from "./lifecycle";
+import { evaluateFreshness, getScanState, recordScan, type FreshnessVerdict } from "./freshness";
 import {
   evaluateArticle,
   findDuplicateStory,
   normalizeSourceName,
-  parsePubDate,
   rateSource,
   type NormalizedArticle,
   type StoryTokenSet,
 } from "./relevance";
-import { DAILY_NEWSDATA_REQUEST_LIMIT, getBudgetStats } from "./request-budget";
+import { getConfig, runsPerDay } from "./config";
 import { fetchRssFeeds, type RssArticle, type RssDiscoveryResult } from "./rss";
-import { articleBudgetRemaining, fetchArticleContent, resetArticleBudget } from "./article";
-import { buildExplanation, composePost, finalQualityCheck } from "./compose";
-import { evaluateFreshness, getScanState, recordScan, type FreshnessVerdict } from "./freshness";
+import {
+  buildStoryIdentity,
+  isMaterialFollowUp,
+  STAGE_RANK,
+  type StoryStage,
+} from "./story";
+import {
+  checkFloodControl,
+  meetsPopularityBar,
+  popularityScore,
+  type PopularityInput,
+} from "./flood";
+import { clearQueueOnceOnDeploy } from "./queue";
 import {
   claimPublishSlot,
-  getPublishState,
-  isHighPriorityStory,
   releasePublishSlot,
-  type SlotRefusal,
 } from "./publishing";
-import { cleanText } from "./text";
-import { buildStoryIdentity, isMaterialFollowUp, STAGE_RANK, type StoryStage, type StoryStage as Stage } from "./story";
 
 /**
- * DynaSport automation pipeline — runs 24/7, every 10 minutes, all year.
+ * DynaSport automation pipeline — every 10 minutes, 24/7.
  *
- *   cron-job.org (every 10 minutes, around the clock)
- *     -> protected /api/football/automation endpoint
- *     -> single-flight lease (overlapping runs exit early)
- *     -> paced publish of the next queued story, one per run, no daily cap
- *        (retry-safe; uncertain
- *        Facebook outcomes are reconciled before any retry)
- *     -> shared daily budget check (max 200 NewsData.io requests/day)
- *     -> NewsData.io discovery (at most one request per run)
- *     -> rotating validated RSS feeds (zero NewsData credits; keeps
- *        working after the NewsData budget is exhausted)
- *     -> relevance + freshness + source filtering
- *     -> three-layer duplicate protection (exact article, same story,
- *        database claim) with materially-new-development follow-ups
- *     -> Neon PostgreSQL
- *     -> concise DynaSport post -> Meta Graph API -> Facebook Page
- *
- * Every run is bounded by RUN_DEADLINE_MS because cron-job.org aborts the
- * connection after 30 seconds. Work that does not fit simply happens on
- * the next run ten minutes later — the system recovers automatically.
+ *   1. Expire anything whose publishing window closed (incl. retries).
+ *   2. RSS batch discovery (never hits the whole registry).
+ *   3. Deduplicate: exact article, cross-publisher story, story/stage
+ *   4. Deduplicate: exact article, cross-publisher story, story/stage
+ *      claims, and an exact post-text hash.
+ *   5. Compose a context-aware post (fetch article detail when needed,
+ *      run the final quality gate).
+ *   6. Claim one atomic publish slot, validate the item's freshness and
+ *      lifecycle IMMEDIATELY before the Facebook call, then post.
+ *   7. Record the run in Neon.
  */
-
-const MAX_PUBLISH_ATTEMPTS = 8;
-const RUN_DEADLINE_MS = 22_000;
-/** Reserved time for the publish step after discovery. */
 const PUBLISH_RESERVE_MS = 8_000;
 const LEASE_SECONDS = 50;
+const MAX_PUBLISH_ATTEMPTS = 8;
 
 interface RssRunStats {
   feedsChecked: number;
@@ -84,30 +91,35 @@ export interface AutomationSummary {
   startedAt: string;
   finishedAt: string | null;
   durationMs: number | null;
-  status: "ok" | "budget_exhausted" | "skipped_overlap" | "error";
+  status: "ok" | "skipped_overlap" | "error";
   trigger: string;
-  newsdataRequests: number;
-  budgetUsedToday: number | null;
-  budgetLimit: number;
+  /** Expected runs/day at the configured cron interval (reporting only). */
+  runsPerDayExpected: number;
   fetched: number;
   newCandidates: number;
   rejected: number;
   duplicatesSkipped: number;
-  dedupe: DedupeStats;
   notNewRejected: number;
+  expired: number;
+  /** Items cancelled by the one-time deploy clear (0 on normal runs). */
+  queueCleared: number;
+  dedupe: DedupeStats;
   rss: RssRunStats;
   publish: {
     attempted: boolean;
     published: boolean;
     reconciled: boolean;
-    /** True when the story bypassed ordinary spacing (breaking news). */
     highPriority: boolean;
     itemId: string | null;
     fbPostId: string | null;
     error: string | null;
-    skippedReason: SlotRefusal | "no_candidate" | null;
+    skippedReason: "spacing" | "no_candidate" | null;
     postsToday: number;
+    postsLastHour: number;
     nextEligibleAt: string | null;
+    withPhoto: boolean;
+    textFallback: boolean;
+    popularityScore: number;
   };
   discoveryError: string | null;
   error: string | null;
@@ -115,33 +127,28 @@ export interface AutomationSummary {
 
 export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled"): Promise<AutomationSummary> {
   const startedAt = new Date();
-  const deadline = startedAt.getTime() + RUN_DEADLINE_MS;
+  const deadline = startedAt.getTime() + getConfig().runDeadlineMs;
   const summary: AutomationSummary = {
     startedAt: startedAt.toISOString(),
     finishedAt: null,
     durationMs: null,
     status: "ok",
     trigger,
-    newsdataRequests: 0,
-    budgetUsedToday: null,
-    budgetLimit: DAILY_NEWSDATA_REQUEST_LIMIT,
+    runsPerDayExpected: runsPerDay(),
     fetched: 0,
     newCandidates: 0,
     rejected: 0,
     duplicatesSkipped: 0,
-    dedupe: {
-      exactDuplicates: 0,
-      storyDuplicates: 0,
-      staleRejected: 0,
-      irrelevantRejected: 0,
-      followUpsAccepted: 0,
-    },
-    rss: { feedsChecked: 0, feedsOk: 0, fetched: 0, newCandidates: 0, rejected: 0, duplicatesSkipped: 0, errors: 0 },
     notNewRejected: 0,
+    expired: 0,
+    queueCleared: 0,
+    dedupe: { exactDuplicates: 0, storyDuplicates: 0, staleRejected: 0, irrelevantRejected: 0, followUpsAccepted: 0 },
+    rss: { feedsChecked: 0, feedsOk: 0, fetched: 0, newCandidates: 0, rejected: 0, duplicatesSkipped: 0, errors: 0 },
     publish: {
       attempted: false, published: false, reconciled: false, highPriority: false,
       itemId: null, fbPostId: null, error: null, skippedReason: null,
-      postsToday: 0, nextEligibleAt: null,
+      postsToday: 0, postsLastHour: 0, nextEligibleAt: null,
+      withPhoto: false, textFallback: false, popularityScore: 0,
     },
     discoveryError: null,
     error: null,
@@ -156,9 +163,13 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
     return summary;
   }
 
-  // Single-flight: if another execution is mid-run, exit immediately. The
-  // budget counter and publication claims are independently safe, so this
-  // is purely to avoid redundant work from overlapping triggers.
+  // One-time, automatic clear of any pre-existing queue backlog. Guarded by
+  // a marker row so it runs only on the first run after deployment.
+  const autoClear = await clearQueueOnceOnDeploy();
+  if (autoClear) {
+    summary.queueCleared = autoClear.cancelled;
+  }
+
   const lease = await acquireLease();
   if (!lease) {
     summary.status = "skipped_overlap";
@@ -168,13 +179,10 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
   }
 
   const scan = await getScanState();
-
   resetArticleBudget();
 
   try {
-    // Stage 1 — RSS discovery. Runs before publishing so that a story
-    // discovered in this run can be published in the same run instead of
-    // waiting ~10 minutes for the next one, which matters for a news page.
+    // Stage 1 — RSS discovery.
     let rssResult: RssDiscoveryResult | null = null;
     if (Date.now() < deadline) {
       try {
@@ -192,29 +200,7 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
       }
     }
 
-    // Stage 2 — NewsData.io corroboration inside the shared daily budget.
-    if (Date.now() < deadline) {
-      try {
-        const fetchResult = await fetchLatestFootballNews();
-        if (fetchResult.kind === "limit_reached") {
-          summary.status = "budget_exhausted";
-        } else if (fetchResult.kind === "error") {
-          summary.discoveryError = fetchResult.error;
-          summary.newsdataRequests = fetchResult.error.includes("not configured") ? 0 : 1;
-        } else {
-          summary.newsdataRequests = 1;
-          summary.fetched = fetchResult.received;
-          await ingestNewsDataArticles(fetchResult.articles, summary, scan.lastSuccessfulScanAt);
-        }
-      } catch (error) {
-        summary.discoveryError = errorMessage(error);
-      }
-    }
-
-    // Stage 3 — publish the best eligible story discovered above. Publishing
-    // is fast, but it is still deadline-guarded so a slow discovery phase can
-    // never stop the run from finishing cleanly (the story simply goes out on
-    // the next run).
+    // Stage 3 — publish the best eligible story, deadline-guarded.
     if (Date.now() < deadline + PUBLISH_RESERVE_MS) {
       try {
         await publishNextCandidate(summary);
@@ -223,29 +209,16 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
       }
     }
 
-    try {
-      const budget = await getBudgetStats();
-      summary.budgetUsedToday = budget.used;
-    } catch {
-      summary.budgetUsedToday = null;
-    }
-
-    const newsdataFailed =
-      summary.discoveryError !== null && summary.newsdataRequests === 0 && summary.fetched === 0;
-    const rssFailed =
-      rssResult === null || (rssResult.feedsChecked > 0 && rssResult.feedsOk === 0 && rssResult.articles.length === 0);
-    if (summary.status === "ok" && newsdataFailed && rssFailed && summary.discoveryError) {
-      // Transient: the next scheduled run (10 minutes later) retries.
-      summary.status = "error";
-      summary.error = "All discovery paths failed this run";
-    }
-    // Checkpoint the scan: successful only when discovery actually worked,
-    // so an outage cannot advance the freshness window past missed stories.
-    const discoveryWorked =
-      (rssResult !== null && rssResult.feedsOk > 0) || summary.fetched > 0;
+    const discoveryWorked = rssResult !== null && rssResult.feedsOk > 0;
+    summary.fetched = rssResult ? rssResult.fetched : 0;
     await recordScan(discoveryWorked);
   } finally {
     await releaseLease(lease);
+  }
+
+  if (summary.status === "ok" && summary.discoveryError !== null && summary.rss.feedsOk === 0) {
+    summary.status = "error";
+    summary.error = "Feed discovery failed this run";
   }
 
   finalize(summary, startedAt);
@@ -274,8 +247,6 @@ async function acquireLease(): Promise<string | null> {
     `) as { holder: string }[];
     return rows.length > 0 ? holder : null;
   } catch {
-    // If leasing is unavailable, continue: budget and publication claims
-    // remain atomic, so correctness does not depend on the lease.
     return randomUUID();
   }
 }
@@ -285,29 +256,40 @@ async function releaseLease(holder: string | null): Promise<void> {
   try {
     const sql = getDb();
     await sql`
-      UPDATE automation_lease
-      SET expires_at = now()
+      UPDATE automation_lease SET expires_at = now()
       WHERE id = 1 AND holder = ${holder}::uuid
     `;
   } catch {
-    // Lease expires on its own; nothing to do.
+    // Lease expires on its own.
   }
 }
 
 /* ------------------------------------------------------------------ */
-/* Stage 1: atomic claim + publish + reconcile                          */
+/* Stage 3: expire, validate, claim, publish                           */
 /* ------------------------------------------------------------------ */
 
 async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
   const sql = getDb();
 
-  // Peek at the best eligible candidate BEFORE consuming a publishing slot.
+  // Expire anything whose window closed — including items awaiting retry.
+  const sweep = await sweepExpired();
+  summary.expired += sweep.expired;
+
+  const watermarkRows = (await sql`
+    SELECT queue_reset_at FROM scan_state WHERE id = 1
+  `) as { queue_reset_at: string | null }[];
+  const queueResetAt = watermarkRows[0]?.queue_reset_at ?? null;
+
   const peek = (await sql`
-    SELECT id, relevance_score, story_stage_rank, is_rumour, source_name
+    SELECT id, relevance_score, story_stage_rank, is_rumour, source_name, priority_score,
+           story_fingerprint, freshness_category
     FROM news_items
     WHERE status = 'candidate'
       AND (next_retry_at IS NULL OR next_retry_at <= now())
-    ORDER BY relevance_score DESC, published_at DESC NULLS LAST, created_at ASC
+      AND (publish_after IS NULL OR publish_after <= now())
+      AND (expires_at IS NULL OR expires_at > now())
+      AND (${queueResetAt}::timestamptz IS NULL OR first_seen_at >= ${queueResetAt}::timestamptz)
+    ORDER BY priority_score DESC, published_at ASC NULLS LAST, created_at ASC
     LIMIT 1
   `) as {
     id: string;
@@ -315,42 +297,59 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
     story_stage_rank: number;
     is_rumour: boolean;
     source_name: string | null;
+    priority_score: number;
+    story_fingerprint: string | null;
+    freshness_category: string | null;
   }[];
-
-  const state = await getPublishState();
-  summary.publish.postsToday = state.postsToday;
-  summary.publish.nextEligibleAt = state.nextEligibleAt;
 
   if (peek.length === 0) {
     summary.publish.skippedReason = "no_candidate";
     return;
   }
 
-  // A high-priority story bypasses the ordinary spacing interval. This
-  // covers confirmed announcements AND significant rumours from credible
-  // reporters, because transfer rumours are core football-news content.
-  // It is a pacing bypass only — there is no daily allowance, so no story
-  // is ever held back by a post counter.
-  const highPriority = isHighPriorityStory(
-    peek[0].relevance_score,
-    peek[0].story_stage_rank ?? 0,
-    peek[0].is_rumour,
-    rateSource(peek[0].source_name, null),
-  );
+  // ── Anti-flood: no daily cap, but a rolling one-hour burst limit. ──
+  // Posts may go out at any hour and any number per day; only rapid
+  // bursts are limited, and the window rolls so nothing is held for long.
+  const flood = await checkFloodControl();
+  summary.publish.postsLastHour = flood.postsLastHour;
+  summary.publish.nextEligibleAt = flood.nextEligibleAt;
+  if (!flood.allowed) {
+    summary.publish.skippedReason = "spacing";
+    summary.publish.error = `anti-flood: ${flood.reason}`;
+    return;
+  }
+
+  // ── Popularity bar: only stories with broad football interest publish. ──
+  const popularityInput: PopularityInput = {
+    relevanceScore: peek[0].relevance_score,
+    distinctPublishers: await countDistinctPublishersFor(
+      peek[0].story_fingerprint ?? null,
+      peek[0].source_name,
+    ),
+    isRumour: peek[0].is_rumour,
+    isFollowUp: false,
+    sourceCredibility: rateSource(peek[0].source_name, null),
+    freshnessCategory: (peek[0].freshness_category as PopularityInput["freshnessCategory"]) ?? null,
+  };
+  const popularity = meetsPopularityBar(popularityInput);
+  summary.publish.popularityScore = popularity.score;
+  if (!popularity.passes) {
+    await markInvalid(String(peek[0].id), "cancelled", popularity.reason ?? "below popularity bar");
+    summary.publish.skippedReason = "no_candidate";
+    summary.publish.error = popularity.reason ?? "below popularity bar";
+    return;
+  }
+
+  const highPriority = popularity.score >= 95;
 
   const slot = await claimPublishSlot(highPriority);
-  summary.publish.postsToday = slot.postsToday;
-  summary.publish.nextEligibleAt = slot.nextEligibleAt;
+  summary.publish.nextEligibleAt = slot.nextEligibleAt ?? flood.nextEligibleAt;
   if (!slot.granted) {
-    // Ordinary post inside the short spacing window: nothing is published
-    // this run, and the story simply goes out on the next run. Discovery,
-    // filtering and deduplication continue regardless.
     summary.publish.skippedReason = slot.reason;
     return;
   }
   summary.publish.highPriority = highPriority;
 
-  // Atomically claim exactly one candidate article.
   const claimed = (await sql`
     UPDATE news_items
     SET status = 'publishing',
@@ -361,18 +360,23 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
       SELECT id FROM news_items
       WHERE status = 'candidate'
         AND (next_retry_at IS NULL OR next_retry_at <= now())
-      ORDER BY relevance_score DESC,
-               published_at DESC NULLS LAST,
-               created_at ASC
+        AND (publish_after IS NULL OR publish_after <= now())
+        AND (expires_at IS NULL OR expires_at > now())
+        AND (${queueResetAt}::timestamptz IS NULL OR first_seen_at >= ${queueResetAt}::timestamptz)
+      ORDER BY priority_score DESC, published_at ASC NULLS LAST, created_at ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
     )
     RETURNING id, title, source_name, post_text, attempts,
-              story_fingerprint, story_stage, story_stage_rank, is_followup
+              story_fingerprint, story_stage, story_stage_rank, is_followup,
+              fb_post_id, expires_at, event_at, event_category, first_seen_at, status,
+              image_url, image_origin, image_publisher, article_url
   `) as Pick<
     NewsItemRow,
     | "id" | "title" | "source_name" | "post_text" | "attempts"
     | "story_fingerprint" | "story_stage" | "story_stage_rank" | "is_followup"
+    | "fb_post_id" | "expires_at" | "event_at" | "event_category" | "first_seen_at" | "status"
+    | "image_url" | "image_origin" | "image_publisher" | "article_url"
   >[];
 
   if (claimed.length === 0) {
@@ -385,6 +389,30 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
   summary.publish.attempted = true;
   summary.publish.itemId = item.id;
 
+  // Final lifecycle validation immediately BEFORE the Facebook call.
+  const invalid = await validateBeforePublish({
+    id: String(item.id),
+    status: item.status ?? "candidate",
+    story_fingerprint: item.story_fingerprint,
+    story_stage_rank: item.story_stage_rank ?? 0,
+    post_text: item.post_text,
+    fb_post_id: item.fb_post_id,
+    expires_at: item.expires_at ? new Date(String(item.expires_at)) : null,
+    event_at: item.event_at ? new Date(String(item.event_at)) : null,
+    event_category: item.event_category ?? null,
+    first_seen_at: new Date(String(item.first_seen_at)),
+  });
+  if (invalid) {
+    await markInvalid(String(item.id), invalid.markStatus, invalid.reason);
+    if (invalid.markStatus !== "duplicate") {
+      await releaseStoryClaim(item.story_fingerprint, item.story_stage_rank ?? 0);
+    }
+    await releasePublishSlot();
+    summary.publish.skippedReason = "no_candidate";
+    summary.publish.error = invalid.reason;
+    return;
+  }
+
   if (!item.post_text || !isValidPostText(item.post_text)) {
     await releaseClaim(item.id, item.attempts, "Stored post text failed DynaSport format validation");
     await releasePublishSlot();
@@ -392,7 +420,7 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
     return;
   }
 
-  // Layer C - database enforcement. One post per (story, stage).
+  // Layer C — one post per (story, stage), enforced by primary key.
   const fingerprint = item.story_fingerprint;
   const stageRank = item.story_stage_rank ?? 0;
   if (fingerprint) {
@@ -406,11 +434,9 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
     if (claimRows.length === 0) {
       await sql`
         UPDATE news_items
-        SET status = 'duplicate',
-            duplicate_kind = 'story',
+        SET status = 'duplicate', duplicate_kind = 'story',
             decision_reason = 'story already published at this stage',
-            next_retry_at = NULL,
-            updated_at = now()
+            next_retry_at = NULL, updated_at = now()
         WHERE id = ${item.id}
       `;
       await releasePublishSlot();
@@ -420,17 +446,141 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
     }
   }
 
+  // ---- Image: download real bytes and validate before uploading ----
+  // Resolution happens HERE, immediately before publishing, so an image is
+  // only fetched for a story that actually passed every freshness,
+  // duplicate and quality check.
+  let imageResult: Awaited<ReturnType<typeof resolveImage>> | null = null;
+  if (item.image_url) {
+    imageResult = await resolveImage([
+      {
+        url: item.image_url,
+        origin: (item.image_origin as ImageCandidate["origin"]) ?? "og:image",
+        publisher: item.image_publisher ?? null,
+      },
+    ]);
+    await recordImageOutcome(item.id, imageResult);
+  } else {
+    await sql`
+      UPDATE news_items SET image_status = 'none_found', updated_at = now()
+      WHERE id = ${item.id}
+    `;
+  }
+
+  const usableImage = imageResult && imageResult.ok ? imageResult : null;
+
   try {
+    if (usableImage) {
+      // One combined photo + caption post.
+      const result = await publishPhotoToFacebook(item.post_text, {
+        bytes: usableImage.bytes,
+        mime: usableImage.mime,
+      });
+      const postId = result.postId ?? result.id;
+      await markPublished(
+        {
+          id: item.id,
+          story_fingerprint: fingerprint,
+          story_stage: item.story_stage,
+          story_stage_rank: stageRank,
+          is_followup: item.is_followup,
+        },
+        postId,
+      );
+      await sql`
+        UPDATE news_items
+        SET fb_photo_id = ${result.id}, publish_mode = 'photo',
+            image_status = 'published_with_image', updated_at = now()
+        WHERE id = ${item.id}
+      `;
+      summary.publish.published = true;
+      summary.publish.fbPostId = postId;
+      summary.publish.withPhoto = true;
+      return;
+    }
+
     const result = await publishToFacebook(item.post_text);
-    await markPublished(item, result.id);
+    await markPublished(
+      {
+        id: item.id,
+        story_fingerprint: fingerprint,
+        story_stage: item.story_stage,
+        story_stage_rank: stageRank,
+        is_followup: item.is_followup,
+      },
+      result.id,
+    );
+    await sql`
+      UPDATE news_items
+      SET publish_mode = 'text',
+          fallback_reason = ${imageResult && !imageResult.ok ? imageResult.reason : "no image available"},
+          updated_at = now()
+      WHERE id = ${item.id}
+    `;
     summary.publish.published = true;
     summary.publish.fbPostId = result.id;
   } catch (error) {
     const uncertain = error instanceof FacebookPublishError ? error.uncertain : true;
+
+    // A photo upload that failed for a CERTAIN reason (bad media, size,
+    // permissions) may fall back to a text-only post — but only after
+    // confirming Facebook did not already accept it, so the same story can
+    // never appear as both a photo post and a text post.
+    if (usableImage && !uncertain) {
+      const already = await findRecentMatchingPost(item.post_text);
+      if (already) {
+        await markPublished(
+          {
+            id: item.id, story_fingerprint: fingerprint, story_stage: item.story_stage,
+            story_stage_rank: stageRank, is_followup: item.is_followup,
+          },
+          already.id,
+        );
+        summary.publish.published = true;
+        summary.publish.reconciled = true;
+        summary.publish.fbPostId = already.id;
+        return;
+      }
+      try {
+        // The failed photo attempt released its hash claim, so the same
+        // caption can now publish as text.
+        const fallback = await publishToFacebook(item.post_text);
+        await markPublished(
+          {
+            id: item.id, story_fingerprint: fingerprint, story_stage: item.story_stage,
+            story_stage_rank: stageRank, is_followup: item.is_followup,
+          },
+          fallback.id,
+        );
+        await sql`
+          UPDATE news_items
+          SET publish_mode = 'text_fallback',
+              fallback_reason = ${`photo upload failed: ${errorMessage(error)}`.slice(0, 400)},
+              updated_at = now()
+          WHERE id = ${item.id}
+        `;
+        summary.publish.published = true;
+        summary.publish.fbPostId = fallback.id;
+        summary.publish.textFallback = true;
+        return;
+      } catch {
+        // Fall through to the normal retry path below.
+      }
+    }
+
     if (uncertain) {
       const found = await findRecentMatchingPost(item.post_text);
       if (found) {
-        await markPublished(item, found.id);
+        await markPublished(
+          {
+            id: item.id,
+            story_fingerprint: fingerprint,
+            story_stage: item.story_stage,
+            story_stage_rank: stageRank,
+            is_followup: item.is_followup,
+          },
+          found.id,
+        );
         summary.publish.published = true;
         summary.publish.reconciled = true;
         summary.publish.fbPostId = found.id;
@@ -438,35 +588,57 @@ async function publishNextCandidate(summary: AutomationSummary): Promise<void> {
       }
     }
     const message = errorMessage(error);
-    if (fingerprint) {
-      try {
-        await sql`
-          DELETE FROM story_publications
-          WHERE fingerprint = ${fingerprint} AND stage_rank = ${stageRank} AND published_at IS NULL
-        `;
-      } catch {
-        // Claim expires with the item; retry logic still applies.
-      }
-    }
+    if (fingerprint) await releaseStoryClaim(fingerprint, stageRank);
     await releaseClaim(item.id, item.attempts, message);
     await releasePublishSlot();
     summary.publish.error = message;
   }
 }
 
+/** Persists image metadata (never binaries, never tokens). */
+async function recordImageOutcome(
+  id: string,
+  result: Awaited<ReturnType<typeof resolveImage>>,
+): Promise<void> {
+  try {
+    const sql = getDb();
+    if (result.ok) {
+      await sql`
+        UPDATE news_items
+        SET image_url = ${result.sourceUrl}, image_final_url = ${result.finalUrl},
+            image_mime = ${result.mime}, image_bytes = ${result.byteSize},
+            image_origin = ${result.origin}, image_publisher = ${result.publisher},
+            image_status = 'validated', image_error = NULL, updated_at = now()
+        WHERE id = ${id}
+      `;
+    } else {
+      await sql`
+        UPDATE news_items
+        SET image_status = ${result.status}, image_error = ${result.reason.slice(0, 400)},
+            updated_at = now()
+        WHERE id = ${id}
+      `;
+    }
+  } catch {
+    // Image bookkeeping must never break publishing.
+  }
+}
+
 async function markPublished(
-  item: { id: string; story_fingerprint: string | null; story_stage: string | null; story_stage_rank: number; is_followup: boolean },
+  item: {
+    id: string;
+    story_fingerprint: string | null;
+    story_stage: string | null;
+    story_stage_rank: number;
+    is_followup: boolean;
+  },
   fbPostId: string,
 ): Promise<void> {
   const sql = getDb();
   await sql`
     UPDATE news_items
-    SET status = 'published',
-        fb_post_id = ${fbPostId},
-        posted_at = now(),
-        next_retry_at = NULL,
-        last_error = NULL,
-        updated_at = now()
+    SET status = 'published', fb_post_id = ${fbPostId}, posted_at = now(),
+        next_retry_at = NULL, last_error = NULL, updated_at = now()
     WHERE id = ${item.id}
   `;
 
@@ -477,27 +649,18 @@ async function markPublished(
     SET fb_post_id = ${fbPostId}, published_at = now()
     WHERE fingerprint = ${item.story_fingerprint} AND stage_rank = ${item.story_stage_rank}
   `;
-
-  // The story is now published at this stage and is excluded from any
-  // future publication attempt below this stage, forever.
   await sql`
     UPDATE stories
     SET published_stage = ${item.story_stage},
         published_stage_rank = GREATEST(published_stage_rank, ${item.story_stage_rank}),
         published_count = published_count + 1,
         followups_published = followups_published + ${item.is_followup ? 1 : 0},
-        last_published_at = now(),
-        updated_at = now()
+        last_published_at = now(), updated_at = now()
     WHERE fingerprint = ${item.story_fingerprint}
   `;
 }
 
-/**
- * A failed Facebook post is never marked as published: it returns to the
- * candidate queue with exponential backoff and stays retryable until the
- * attempt ceiling, after which it is parked as "failed" (unpublished and
- * visible on the dashboard).
- */
+/** A failed Facebook post stays retryable — never falsely marked published. */
 async function releaseClaim(id: string, attempts: number, error: string): Promise<void> {
   const sql = getDb();
   const exhausted = attempts >= MAX_PUBLISH_ATTEMPTS;
@@ -511,19 +674,30 @@ async function releaseClaim(id: string, attempts: number, error: string): Promis
     `;
     return;
   }
-
   await sql`
     UPDATE news_items
-    SET status = 'candidate',
-        last_error = ${error},
+    SET status = 'candidate', last_error = ${error},
         next_retry_at = now() + make_interval(mins => ${backoffMinutes}),
         updated_at = now()
     WHERE id = ${id}
   `;
 }
 
+async function releaseStoryClaim(fingerprint: string | null, stageRank: number): Promise<void> {
+  if (!fingerprint) return;
+  try {
+    const sql = getDb();
+    await sql`
+      DELETE FROM story_publications
+      WHERE fingerprint = ${fingerprint} AND stage_rank = ${stageRank} AND published_at IS NULL
+    `;
+  } catch {
+    // Non-fatal.
+  }
+}
+
 /* ------------------------------------------------------------------ */
-/* Stage 2/3: ingestion (shared by NewsData.io and RSS)                  */
+/* Ingestion (shared): relevance, lifecycle, dedupe, compose           */
 /* ------------------------------------------------------------------ */
 
 interface IngestCounters {
@@ -532,25 +706,12 @@ interface IngestCounters {
   duplicatesSkipped: number;
 }
 
-async function ingestNewsDataArticles(articles: NewsDataArticle[], summary: AutomationSummary, lastScanAt: string | null): Promise<void> {
-  const inputs: (NormalizedArticle & { articleId: string })[] = [];
-  for (const raw of articles) {
-    const normalized = normalizeNewsDataArticle(raw);
-    if (!normalized) {
-      summary.duplicatesSkipped += 1;
-      summary.dedupe.exactDuplicates += 1;
-      continue;
-    }
-    inputs.push(normalized);
-  }
-  const counters = await ingestNormalized(inputs, "newsdata", null, summary, lastScanAt);
-  summary.newCandidates += counters.newCandidates;
-  summary.rejected += counters.rejected;
-  summary.duplicatesSkipped += counters.duplicatesSkipped;
-}
-
-async function ingestRssArticles(articles: RssArticle[], summary: AutomationSummary, lastScanAt: string | null): Promise<void> {
-  const inputs: (NormalizedArticle & { articleId: string })[] = [];
+async function ingestRssArticles(
+  articles: RssArticle[],
+  summary: AutomationSummary,
+  lastScanAt: string | null,
+): Promise<void> {
+  const inputs: (NormalizedArticle & { articleId: string; imageCandidates?: ImageCandidate[] })[] = [];
   const feedByDedupeKey = new Map<string, string>();
   for (const raw of articles) {
     feedByDedupeKey.set(raw.dedupeKey, raw.feedName);
@@ -565,6 +726,7 @@ async function ingestRssArticles(articles: RssArticle[], summary: AutomationSumm
       language: "en",
       categories: ["sports"],
       fromFootballFeed: true,
+      imageCandidates: raw.imageCandidates,
     });
   }
   const counters = await ingestNormalized(inputs, "rss", feedByDedupeKey, summary, lastScanAt);
@@ -573,15 +735,9 @@ async function ingestRssArticles(articles: RssArticle[], summary: AutomationSumm
   summary.rss.duplicatesSkipped += counters.duplicatesSkipped;
 }
 
-/**
- * Shared ingestion implementing duplicate-protection layers A and B:
- *   A. exact article identity (unique dedupe key in the database);
- *   B. same-story identity (deterministic fingerprint + headline
- *      similarity across publishers), with stage-aware follow-ups.
- */
 async function ingestNormalized(
-  inputs: (NormalizedArticle & { articleId: string })[],
-  provider: "newsdata" | "rss",
+  inputs: (NormalizedArticle & { articleId: string; imageCandidates?: ImageCandidate[] })[],
+  provider: string,
   feedByDedupeKey: Map<string, string> | null,
   summary: AutomationSummary,
   lastScanAt: string | null,
@@ -590,8 +746,8 @@ async function ingestNormalized(
   if (inputs.length === 0) return counters;
 
   const sql = getDb();
+  const now = new Date();
 
-  // Recent stories for cross-publisher similarity matching.
   const recentRows = (await sql`
     SELECT id, title_tokens, story_fingerprint
     FROM news_items
@@ -607,23 +763,17 @@ async function ingestNormalized(
       tokens: Array.isArray(row.title_tokens) ? (row.title_tokens as string[]) : [],
     }))
     .filter((set) => set.tokens.length > 0);
-
   const batchSets: StoryTokenSet[] = [];
 
   for (const article of inputs) {
-    const decision = evaluateArticle(article);
+    const decision = evaluateArticle(article, now);
     const sourceName = normalizeSourceName({
       source_name: article.sourceName,
       source_id: article.sourceId,
     });
-    const feedName =
-      provider === "rss" ? feedByDedupeKey?.get(article.articleId) ?? article.sourceName : null;
+    const feedName = provider === "rss" ? (feedByDedupeKey?.get(article.articleId) ?? article.sourceName) : null;
 
     const identity = buildStoryIdentity(article.title, article.description);
-
-    // Layer B — canonicalize the fingerprint: if this headline closely
-    // matches a story already captured from another publisher, adopt that
-    // story's fingerprint so both map to one underlying story.
     const similar = decision.relevant
       ? findDuplicateStory(decision.titleTokens, [...recent, ...batchSets])
       : null;
@@ -634,17 +784,16 @@ async function ingestNormalized(
     let isFollowUp = false;
     let reason = decision.reason;
 
+    // Story already posted, or already queued? Only a materially new
+    // development may post again.
     if (decision.relevant) {
       const storyRows = (await sql`
         SELECT published_stage_rank, published_count, followups_published
         FROM stories
         WHERE fingerprint = ${fingerprint}
       `) as { published_stage_rank: number; published_count: number; followups_published: number }[];
-
       const story = storyRows[0];
       if (story && story.published_count > 0) {
-        // The underlying story has already been posted. Only a materially
-        // new development (bid / agreement / official) may post again.
         if (isMaterialFollowUp(story.published_stage_rank, identity.stageRank, story.followups_published)) {
           isFollowUp = true;
           reason = `follow-up: story advanced to "${identity.stage}" (was rank ${story.published_stage_rank})`;
@@ -654,42 +803,26 @@ async function ingestNormalized(
           reason = "duplicate of a story DynaSport already published";
         }
       } else if (similar) {
-        // Same story already queued (not yet posted) — do not queue twice.
         status = "duplicate";
         duplicateKind = "story";
         reason = "duplicate of a story already queued from another source";
       }
     }
 
-    // --- Freshness + significance policy ---
-    // Breaking (<=6h, confirmed) and fresh (<=48h) stories publish on their
-    // own merits. A 2-7 day old story only publishes as "trending" when at
-    // least two DISTINCT credible publishers independently report it, and a
-    // story older than that is rejected unless it is a materially new
-    // development. NewsData.io items never publish because the free plan
-    // delivers them delayed.
-    let freshness: FreshnessVerdict | null = null;
-    if (provider === "newsdata") {
-      freshness = {
-        category: "older",
-        ageMinutes: null,
-        eligible: false,
-        requiresCorroboration: false,
-        reason: "NewsData.io free-plan delivery is delayed and is not used as a publishing source",
-      };
-    } else {
-      const distinctPublishers = await countDistinctPublishers(fingerprint, sourceName);
-      freshness = evaluateFreshness(
-        {
-          publishedAt: article.publishedAt,
-          stageRank: identity.stageRank,
-          isRumour: decision.isRumour,
-          score: decision.score,
-          distinctPublishers,
-        },
-        new Date(),
-      );
-    }
+    // Freshness + significance policy.
+    // RSS is the sole discovery source, so every story is judged on its own
+    // freshness and corroboration evidence.
+    const distinctPublishers = await countDistinctPublishers(fingerprint, sourceName);
+    const freshness: FreshnessVerdict = evaluateFreshness(
+      {
+        publishedAt: article.publishedAt,
+        stageRank: identity.stageRank,
+        isRumour: decision.isRumour,
+        score: decision.score,
+        distinctPublishers,
+      },
+      now,
+    );
 
     if (status === "candidate" && !freshness.eligible) {
       status = "rejected";
@@ -697,8 +830,6 @@ async function ingestNormalized(
       summary.notNewRejected += 1;
     }
 
-    // A story already published by DynaSport may not be re-posted merely
-    // because it remains popular; only a materially new development may.
     if (status === "candidate" && freshness.category === "trending") {
       const alreadyPublished = await storyAlreadyPublished(fingerprint);
       if (alreadyPublished) {
@@ -708,46 +839,52 @@ async function ingestNormalized(
       }
     }
 
-    // --- Compose headline + explanation, fetching detail when needed ---
+    // Lifecycle: category, priority and publishing window. The reference
+    // time is the ORIGINAL publication time, never the discovery time.
+    const lifecycle = computeLifecycle(
+      article.title,
+      identity.eventKind,
+      identity.stage,
+      decision.isRumour,
+      decision.score,
+      article.publishedAt,
+      now,
+    );
+    if (status === "candidate" && lifecycle.expiresAt && lifecycle.expiresAt <= now) {
+      status = "rejected";
+      reason = `already expired (${lifecycle.category}: publishing window closed before discovery)`;
+      summary.notNewRejected += 1;
+    }
+
+    // Compose + quality gate, fetching article detail when needed.
     let postText: string | null = null;
     let headline: string | null = null;
     let explanation: string | null = null;
+    let imageCandidates: ImageCandidate[] = article.imageCandidates ?? [];
     if (status === "candidate" && decision.statement && sourceName) {
-      // The RSS summary is often truncated. When it cannot support a
-      // complete explanation, fetch the publisher's article once and read
-      // the accessible text, respecting robots.txt and rate limits.
       let sourceText: string | null = article.description;
-      let firstAttempt = buildExplanation(
-        sourceText,
-        decision.statement,
-        identity.stage,
-        decision.isRumour,
-      );
+      let body = buildExplanation(sourceText, decision.statement, identity.stage, decision.isRumour);
       const needsDetail =
-        !firstAttempt ||
-        countWordsOf(firstAttempt) < 30 ||
+        !body ||
+        countWordsOf(body) < 30 ||
         /(?:\.\.\.|\u2026|…)$/.test((article.description ?? "").trim());
 
       if (needsDetail && article.articleUrl && articleBudgetRemaining() > 0) {
         const content = await fetchArticleContent(article.articleUrl);
         if (content.text) {
-          // Prefer the fuller article text, but keep the summary too: the
-          // lead paragraph often reads better than extracted markup.
           sourceText = `${article.description ?? ""}\n\n${content.text}`;
-          firstAttempt = buildExplanation(
-            sourceText,
-            decision.statement,
-            identity.stage,
-            decision.isRumour,
-          );
+          body = buildExplanation(sourceText, decision.statement, identity.stage, decision.isRumour);
+        }
+        // Harvest the publisher's own share image from the same fetch.
+        if (content.html && article.articleUrl) {
+          imageCandidates = [
+            ...imageCandidates,
+            ...imageCandidatesFromHtml(content.html, article.articleUrl, sourceName),
+          ];
         }
       }
 
-      const composed = firstAttempt
-        ? composePost(decision.statement, firstAttempt, sourceName)
-        : null;
-
-      // Final editorial gate before this story can ever be queued.
+      const composed = body ? composePost(decision.statement, body, sourceName) : null;
       if (composed) {
         const quality = finalQualityCheck(composed, { sourceText, headline: decision.statement });
         if (quality.ok) {
@@ -767,8 +904,6 @@ async function ingestNormalized(
       reason = "no trustworthy source attribution for a publishable statement";
     }
 
-    // Layer A — exact article identity. The unique key makes this
-    // race-safe across concurrent runs.
     const inserted = (await sql`
       INSERT INTO news_items (
         dedupe_key, title, title_tokens, description, article_url,
@@ -777,7 +912,9 @@ async function ingestNormalized(
         provider, feed_name,
         story_fingerprint, story_stage, story_stage_rank, is_followup,
         duplicate_kind, reject_kind, headline, explanation, age_minutes_at_discovery,
-        freshness_category, requires_corroboration, last_seen_at
+        freshness_category, requires_corroboration, last_seen_at,
+        event_category, priority_score, expires_at, event_at, publish_after,
+        image_url, image_origin, image_publisher, image_status
       )
       VALUES (
         ${article.articleId}, ${article.title}, ${JSON.stringify(decision.titleTokens)}::jsonb,
@@ -788,7 +925,14 @@ async function ingestNormalized(
         ${fingerprint}, ${identity.stage}, ${identity.stageRank}, ${isFollowUp},
         ${duplicateKind}, ${decision.rejectKind}, ${headline}, ${explanation},
         ${freshness.ageMinutes}, ${freshness.category}, ${freshness.requiresCorroboration},
-        now()
+        now(),
+        ${lifecycle.category}, ${lifecycle.priorityScore},
+        ${lifecycle.expiresAt ? lifecycle.expiresAt.toISOString() : null},
+        ${lifecycle.eventAt ? lifecycle.eventAt.toISOString() : null},
+        ${now.toISOString()},
+        ${imageCandidates[0]?.url ?? null}, ${imageCandidates[0]?.origin ?? null},
+        ${imageCandidates[0]?.publisher ?? sourceName},
+        ${imageCandidates.length > 0 ? "discovered" : "none_found"}
       )
       ON CONFLICT (dedupe_key) DO NOTHING
       RETURNING id
@@ -800,10 +944,7 @@ async function ingestNormalized(
       continue;
     }
 
-    // Track the story itself (identity, not publication state).
     await upsertStory(fingerprint, identity.entities, identity.eventKind, decision.titleTokens, article.title);
-    // Record this publisher against the story so corroboration counts
-    // DISTINCT publishers rather than article copies.
     await recordStorySource(fingerprint, sourceName);
 
     if (status === "candidate") {
@@ -815,20 +956,6 @@ async function ingestNormalized(
     } else if (status === "duplicate") {
       counters.duplicatesSkipped += 1;
       summary.dedupe.storyDuplicates += 1;
-      if (similar) {
-        const boost = decision.credibility === "top" || decision.credibility === "mainstream" ? 4 : 2;
-        try {
-          await sql`
-            UPDATE news_items
-            SET corroborations = corroborations + 1,
-                relevance_score = LEAST(relevance_score + ${boost}, 130),
-                updated_at = now()
-            WHERE story_fingerprint = ${fingerprint} AND status = 'candidate'
-          `;
-        } catch {
-          // Opportunistic ranking boost only.
-        }
-      }
     } else {
       counters.rejected += 1;
       if (decision.rejectKind === "stale") summary.dedupe.staleRejected += 1;
@@ -839,7 +966,33 @@ async function ingestNormalized(
   return counters;
 }
 
-/** Counts DISTINCT credible publishers reporting this story (including this one). */
+function parseValueDate(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  const isoLike = trimmed.includes("T") ? trimmed : trimmed.replace(" ", "T") + "Z";
+  const parsed = new Date(isoLike);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/* ---------- story tracking helpers ---------- */
+
+/** Read-only distinct-publisher count used by the popularity bar. */
+async function countDistinctPublishersFor(
+  fingerprint: string | null,
+  sourceName: string | null,
+): Promise<number> {
+  if (!fingerprint) return sourceName ? 1 : 0;
+  try {
+    const sql = getDb();
+    const rows = (await sql`
+      SELECT count(*)::int AS n FROM story_sources WHERE fingerprint = ${fingerprint}
+    `) as { n: number }[];
+    return Math.max(sourceName ? 1 : 0, rows[0]?.n ?? 1);
+  } catch {
+    return sourceName ? 1 : 0;
+  }
+}
+
 async function countDistinctPublishers(fingerprint: string, sourceName: string | null): Promise<number> {
   if (!sourceName) return 1;
   try {
@@ -854,7 +1007,6 @@ async function countDistinctPublishers(fingerprint: string, sourceName: string |
   }
 }
 
-/** Records a (story, publisher) pair. The primary key makes it distinct. */
 async function recordStorySource(fingerprint: string, publisher: string | null): Promise<void> {
   if (!publisher) return;
   try {
@@ -862,15 +1014,13 @@ async function recordStorySource(fingerprint: string, publisher: string | null):
     await sql`
       INSERT INTO story_sources (fingerprint, publisher)
       VALUES (${fingerprint}, ${publisher})
-      ON CONFLICT (fingerprint, publisher) DO UPDATE
-        SET last_seen_at = now()
+      ON CONFLICT (fingerprint, publisher) DO UPDATE SET last_seen_at = now()
     `;
   } catch {
     // Corroboration bookkeeping must never break ingestion.
   }
 }
 
-/** True when this story has already been published by DynaSport. */
 async function storyAlreadyPublished(fingerprint: string): Promise<boolean> {
   try {
     const sql = getDb();
@@ -904,29 +1054,6 @@ async function upsertStory(
   }
 }
 
-function normalizeNewsDataArticle(raw: NewsDataArticle): (NormalizedArticle & { articleId: string }) | null {
-  const title = cleanText(raw.title);
-  if (!title) return null;
-
-  const dedupeKey = buildDedupeKey(raw);
-  if (!dedupeKey) return null;
-
-  return {
-    articleId: dedupeKey,
-    title,
-    description: cleanText(raw.description) || null,
-    articleUrl: typeof raw.link === "string" && raw.link.trim().length > 0 ? raw.link.trim() : null,
-    sourceName: normalizeSourceName(raw),
-    sourceId:
-      typeof raw.source_id === "string" && raw.source_id.trim().length > 0 ? raw.source_id.trim() : null,
-    publishedAt: parsePubDate(raw.pubDate),
-    language: typeof raw.language === "string" ? raw.language.trim().toLowerCase() : null,
-    categories: Array.isArray(raw.category)
-      ? raw.category.filter((c): c is string => typeof c === "string")
-      : [],
-  };
-}
-
 /* ------------------------------------------------------------------ */
 /* Run bookkeeping                                                      */
 /* ------------------------------------------------------------------ */
@@ -937,16 +1064,16 @@ async function recordRun(summary: AutomationSummary): Promise<void> {
     await sql`
       INSERT INTO automation_runs (
         trigger_source, started_at, finished_at, status,
-        newsdata_requests, budget_used_today, fetched, new_candidates,
+        fetched, new_candidates,
         rejected, duplicates_skipped, published, discovery_error,
         publish_error, error, summary,
         feeds_checked, feeds_ok, rss_fetched, rss_new_candidates,
         exact_duplicates, story_duplicates, stale_rejected, followups_accepted,
-        stale_not_new, publish_skipped_reason
+        stale_not_new, publish_skipped_reason, expired, photo_posts
       )
       VALUES (
         ${summary.trigger}, ${summary.startedAt}, ${summary.finishedAt}, ${summary.status},
-        ${summary.newsdataRequests}, ${summary.budgetUsedToday}, ${summary.fetched},
+        ${summary.fetched},
         ${summary.newCandidates}, ${summary.rejected}, ${summary.duplicatesSkipped},
         ${summary.publish.published ? 1 : 0}, ${summary.discoveryError},
         ${summary.publish.error}, ${summary.error}, ${JSON.stringify(summary)}::jsonb,
@@ -954,11 +1081,12 @@ async function recordRun(summary: AutomationSummary): Promise<void> {
         ${summary.rss.newCandidates},
         ${summary.dedupe.exactDuplicates}, ${summary.dedupe.storyDuplicates},
         ${summary.dedupe.staleRejected}, ${summary.dedupe.followUpsAccepted},
-        ${summary.notNewRejected}, ${summary.publish.skippedReason}
+        ${summary.notNewRejected}, ${summary.publish.skippedReason}, ${summary.expired},
+        ${summary.publish.withPhoto ? 1 : 0}
       )
     `;
   } catch {
-    // Bookkeeping must never break the automation result itself.
+    // Bookkeeping must never break the automation result.
   }
 }
 
@@ -976,7 +1104,9 @@ function countWordsOf(text: string | null): number {
 function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   let safe = message;
-  for (const envName of ["NEWSDATA_API_KEY", "FACEBOOK_PAGE_ACCESS_TOKEN", "FACEBOOK_APP_SECRET", "CRON_SECRET"]) {
+  for (const envName of [
+    "FACEBOOK_PAGE_ACCESS_TOKEN", "FACEBOOK_APP_SECRET", "CRON_SECRET", "DATABASE_URL",
+  ]) {
     const secret = process.env[envName];
     if (secret && secret.length > 0) {
       safe = safe.split(secret).join("[redacted]");

@@ -15,6 +15,8 @@ import { facebookAppCredentials, facebookPageAccessToken, facebookPageId } from 
 
 const GRAPH_API_BASE = "https://graph.facebook.com/v25.0";
 const REQUEST_TIMEOUT_MS = 10_000;
+/** Photo uploads carry bytes, so they get a longer budget. */
+const PHOTO_TIMEOUT_MS = 20_000;
 
 /**
  * The DynaSport post format is exact and intentional:
@@ -161,6 +163,125 @@ export async function publishToFacebook(message: string): Promise<{ id: string }
   }
 
   return { id: record.id };
+}
+
+/**
+ * Publishes a PHOTO POST: validated image bytes plus the football-news
+ * caption in ONE combined Facebook post (never a photo and a separate
+ * text post).
+ *
+ * Uses POST /{page-id}/photos with the image attached as multipart
+ * form-data under the documented `source` field. The response carries the
+ * photo id and `post_id`, the id of the resulting Page post — we store the
+ * latter when present so the dashboard links to the real post.
+ *
+ * The same strict duplicate guard as text posts applies: the exact caption
+ * text is hashed and claimed before upload, so a photo post and a text
+ * post of the same story can never both go out.
+ */
+export async function publishPhotoToFacebook(
+  message: string,
+  image: { bytes: Uint8Array; mime: string },
+): Promise<{ id: string; postId: string | null }> {
+  if (!isValidPostText(message)) {
+    throw new FacebookPublishError("Post text failed DynaSport format validation", null, false);
+  }
+
+  const hash = createHash("sha256").update(message, "utf8").digest("hex");
+  const sql = getDb();
+  const claimed = (await sql`
+    INSERT INTO published_posts (post_hash) VALUES (${hash})
+    ON CONFLICT (post_hash) DO NOTHING
+    RETURNING post_hash
+  `) as { post_hash: string }[];
+  if (claimed.length === 0) {
+    throw new FacebookPublishError("This exact post has already been published", null, false);
+  }
+
+  const pageId = facebookPageId();
+  const token = facebookPageAccessToken();
+
+  const extension = image.mime === "image/png" ? "png" : image.mime === "image/gif" ? "gif" : "jpg";
+  const form = new FormData();
+  // Copy into a fresh ArrayBuffer so Blob gets exactly the image bytes.
+  const copy = new Uint8Array(image.bytes.byteLength);
+  copy.set(image.bytes);
+  form.append("source", new Blob([copy], { type: image.mime }), `dynasport.${extension}`);
+  form.append("caption", message);
+  form.append("access_token", token);
+
+  let response: Response;
+  try {
+    // Content-Type is intentionally NOT set: fetch adds the multipart
+    // boundary itself, and overriding it breaks the upload.
+    response = await fetch(`${GRAPH_API_BASE}/${encodeURIComponent(pageId)}/photos`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(PHOTO_TIMEOUT_MS),
+      cache: "no-store",
+    });
+  } catch (error) {
+    // Uncertain: the upload may have reached Meta. The caller reconciles.
+    throw new FacebookPublishError(
+      `Network error while uploading photo: ${redact(errorMessage(error), token)}`,
+      null,
+      true,
+    );
+  }
+
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new FacebookPublishError(
+      `Meta Graph API returned non-JSON body (HTTP ${response.status})`,
+      null,
+      true,
+    );
+  }
+
+  const record = payload as
+    | { id?: unknown; post_id?: unknown; error?: { message?: unknown; code?: unknown } }
+    | null;
+
+  if (!response.ok || (record && typeof record === "object" && record.error)) {
+    const metaError = record && typeof record === "object" ? record.error : undefined;
+    const message2 =
+      metaError && typeof metaError.message === "string" ? metaError.message : `HTTP ${response.status}`;
+    const code = metaError && typeof metaError.code === "number" ? metaError.code : null;
+    // Release the hash claim: this exact caption did NOT publish, so it
+    // must stay eligible (for a retry, or for a text-only fallback).
+    await releasePostHash(hash);
+    throw new FacebookPublishError(
+      `Meta Graph API photo error${code !== null ? ` ${code}` : ""}: ${redact(message2, token)}`,
+      code,
+      false,
+    );
+  }
+
+  if (!record || typeof record.id !== "string" || record.id.length === 0) {
+    throw new FacebookPublishError("Meta Graph API did not return a photo id", null, true);
+  }
+
+  return {
+    id: record.id,
+    postId: typeof record.post_id === "string" ? record.post_id : null,
+  };
+}
+
+/** Releases an unused post-hash claim so the text can be published later. */
+export async function releasePostHash(hash: string): Promise<void> {
+  try {
+    const sql = getDb();
+    await sql`DELETE FROM published_posts WHERE post_hash = ${hash} AND fb_post_id IS NULL`;
+  } catch {
+    // Non-fatal: at worst this exact text stays blocked, never duplicated.
+  }
+}
+
+/** Hash used by the duplicate guard, exposed so callers can release it. */
+export function postHashOf(message: string): string {
+  return createHash("sha256").update(message, "utf8").digest("hex");
 }
 
 /**

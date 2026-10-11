@@ -119,15 +119,6 @@ async function createSchema(): Promise<void> {
   const sql = getDb();
 
   await sql`
-    CREATE TABLE IF NOT EXISTS request_budget (
-      day text PRIMARY KEY,
-      used integer NOT NULL DEFAULT 0,
-      limit_reached_at timestamptz,
-      updated_at timestamptz NOT NULL DEFAULT now()
-    )
-  `;
-
-  await sql`
     CREATE TABLE IF NOT EXISTS news_items (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
       dedupe_key text NOT NULL UNIQUE,
@@ -173,8 +164,6 @@ async function createSchema(): Promise<void> {
       started_at timestamptz NOT NULL DEFAULT now(),
       finished_at timestamptz,
       status text NOT NULL DEFAULT 'ok',
-      newsdata_requests integer NOT NULL DEFAULT 0,
-      budget_used_today integer,
       fetched integer NOT NULL DEFAULT 0,
       new_candidates integer NOT NULL DEFAULT 0,
       rejected integer NOT NULL DEFAULT 0,
@@ -191,21 +180,6 @@ async function createSchema(): Promise<void> {
   await sql`
     CREATE INDEX IF NOT EXISTS automation_runs_started_idx
       ON automation_runs (started_at DESC)
-  `;
-
-  // Rolling-window request events complement the per-day counter so usage
-  // stays within 200 requests in ANY 24-hour period, regardless of the
-  // provider's actual credit reset timezone.
-  await sql`
-    CREATE TABLE IF NOT EXISTS request_events (
-      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-      created_at timestamptz NOT NULL DEFAULT now()
-    )
-  `;
-
-  await sql`
-    CREATE INDEX IF NOT EXISTS request_events_created_idx
-      ON request_events (created_at DESC)
   `;
 
   // Monitored RSS/Atom feeds with health + conditional-GET state.
@@ -228,7 +202,7 @@ async function createSchema(): Promise<void> {
   `;
 
   // Additive columns for pre-existing deployments (idempotent).
-  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'newsdata'`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'rss'`;
   await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS feed_name text`;
   await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS corroborations integer NOT NULL DEFAULT 1`;
 
@@ -407,6 +381,45 @@ async function createSchema(): Promise<void> {
 
   // Article-content cache: prevents re-downloading the same article page
   // within a day, which is both polite to publishers and fast.
+  /* -------------------------------------------------------------- */
+  /* Publishing lifecycle (time-sensitive news publishing)           */
+  /* -------------------------------------------------------------- */
+
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS event_category text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS priority_score integer NOT NULL DEFAULT 50`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS publish_after timestamptz`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS expires_at timestamptz`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS event_at timestamptz`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS updated_at_checked timestamptz`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS cancelled_at timestamptz`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS cancel_reason text`;
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS news_items_publish_idx
+      ON news_items (priority_score DESC, published_at ASC)
+      WHERE status = 'candidate'
+  `;
+  await sql`
+    CREATE INDEX IF NOT EXISTS news_items_expiry_idx
+      ON news_items (expires_at)
+      WHERE expires_at IS NOT NULL
+  `;
+
+  // Audit trail for controlled queue resets.
+  await sql`
+    CREATE TABLE IF NOT EXISTS queue_resets (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      performed_at timestamptz NOT NULL DEFAULT now(),
+      candidate_cancelled integer NOT NULL DEFAULT 0,
+      publishing_reconciled integer NOT NULL DEFAULT 0,
+      publishing_cancelled integer NOT NULL DEFAULT 0,
+      failed_cancelled integer NOT NULL DEFAULT 0,
+      notes text
+    )
+  `;
+
+  await sql`ALTER TABLE scan_state ADD COLUMN IF NOT EXISTS queue_reset_at timestamptz`;
+
   await sql`
     CREATE TABLE IF NOT EXISTS article_cache (
       url text PRIMARY KEY,
@@ -472,6 +485,30 @@ async function createSchema(): Promise<void> {
 
   await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS stale_not_new integer NOT NULL DEFAULT 0`;
   await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS publish_skipped_reason text`;
+  await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS expired integer NOT NULL DEFAULT 0`;
+  await sql`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS photo_posts integer NOT NULL DEFAULT 0`;
+
+  /* -------------------------------------------------------------- */
+  /* Image metadata (metadata only — binaries are never stored)      */
+  /* -------------------------------------------------------------- */
+
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_url text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_final_url text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_mime text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_bytes integer`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_origin text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_publisher text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_status text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS image_error text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS fb_photo_id text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS publish_mode text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS fallback_reason text`;
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS news_items_image_status_idx
+      ON news_items (image_status)
+      WHERE image_status IS NOT NULL
+  `;
 }
 
 /* ------------------------------------------------------------------ */
@@ -507,8 +544,19 @@ export interface NewsItemRow {
   next_retry_at: string | null;
   last_error: string | null;
   fb_post_id: string | null;
+  fb_photo_id: string | null;
+  publish_mode: string | null;
+  fallback_reason: string | null;
+  image_url: string | null;
+  image_final_url: string | null;
+  image_mime: string | null;
+  image_bytes: number | null;
+  image_origin: string | null;
+  image_publisher: string | null;
+  image_status: string | null;
+  image_error: string | null;
   posted_at: string | null;
-  provider: "newsdata" | "rss";
+  provider: string;
   feed_name: string | null;
   corroborations: number;
   story_fingerprint: string | null;
@@ -517,6 +565,13 @@ export interface NewsItemRow {
   is_followup: boolean;
   duplicate_kind: string | null;
   reject_kind: string | null;
+  priority_score: number;
+  event_category: string | null;
+  publish_after: string | null;
+  expires_at: string | null;
+  event_at: string | null;
+  cancelled_at: string | null;
+  cancel_reason: string | null;
   first_seen_at: string;
   headline: string | null;
   explanation: string | null;
@@ -531,8 +586,6 @@ export interface AutomationRunRow {
   started_at: string;
   finished_at: string | null;
   status: string;
-  newsdata_requests: number;
-  budget_used_today: number | null;
   fetched: number;
   new_candidates: number;
   rejected: number;
