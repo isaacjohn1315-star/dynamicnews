@@ -19,8 +19,9 @@ import {
 } from "./relevance";
 import { DAILY_NEWSDATA_REQUEST_LIMIT, getBudgetStats } from "./request-budget";
 import { fetchRssFeeds, type RssArticle, type RssDiscoveryResult } from "./rss";
-import { buildExplanation, composePost } from "./compose";
-import { evaluateFreshness, getScanState, recordScan } from "./freshness";
+import { articleBudgetRemaining, fetchArticleContent, resetArticleBudget } from "./article";
+import { buildExplanation, composePost, finalQualityCheck } from "./compose";
+import { evaluateFreshness, getScanState, recordScan, type FreshnessVerdict } from "./freshness";
 import {
   claimPublishSlot,
   getPublishState,
@@ -167,6 +168,8 @@ export async function runAutomation(trigger: "scheduled" | "manual" = "scheduled
   }
 
   const scan = await getScanState();
+
+  resetArticleBudget();
 
   try {
     // Stage 1 — RSS discovery. Runs before publishing so that a story
@@ -658,30 +661,103 @@ async function ingestNormalized(
       }
     }
 
-    // --- Freshness gate: only genuinely NEW stories may be published ---
-    const freshness = evaluateFreshness(article.publishedAt, provider, lastScanAt);
-    if (status === "candidate" && !freshness.publishable) {
+    // --- Freshness + significance policy ---
+    // Breaking (<=6h, confirmed) and fresh (<=48h) stories publish on their
+    // own merits. A 2-7 day old story only publishes as "trending" when at
+    // least two DISTINCT credible publishers independently report it, and a
+    // story older than that is rejected unless it is a materially new
+    // development. NewsData.io items never publish because the free plan
+    // delivers them delayed.
+    let freshness: FreshnessVerdict | null = null;
+    if (provider === "newsdata") {
+      freshness = {
+        category: "older",
+        ageMinutes: null,
+        eligible: false,
+        requiresCorroboration: false,
+        reason: "NewsData.io free-plan delivery is delayed and is not used as a publishing source",
+      };
+    } else {
+      const distinctPublishers = await countDistinctPublishers(fingerprint, sourceName);
+      freshness = evaluateFreshness(
+        {
+          publishedAt: article.publishedAt,
+          stageRank: identity.stageRank,
+          isRumour: decision.isRumour,
+          score: decision.score,
+          distinctPublishers,
+        },
+        new Date(),
+      );
+    }
+
+    if (status === "candidate" && !freshness.eligible) {
       status = "rejected";
       reason = freshness.reason;
       summary.notNewRejected += 1;
     }
 
-    // --- Compose headline + explanation ---
+    // A story already published by DynaSport may not be re-posted merely
+    // because it remains popular; only a materially new development may.
+    if (status === "candidate" && freshness.category === "trending") {
+      const alreadyPublished = await storyAlreadyPublished(fingerprint);
+      if (alreadyPublished) {
+        status = "duplicate";
+        duplicateKind = "story";
+        reason = "trending story already published by DynaSport — no new development";
+      }
+    }
+
+    // --- Compose headline + explanation, fetching detail when needed ---
     let postText: string | null = null;
     let headline: string | null = null;
     let explanation: string | null = null;
     if (status === "candidate" && decision.statement && sourceName) {
-      const body = buildExplanation(
-        article.description,
+      // The RSS summary is often truncated. When it cannot support a
+      // complete explanation, fetch the publisher's article once and read
+      // the accessible text, respecting robots.txt and rate limits.
+      let sourceText: string | null = article.description;
+      let firstAttempt = buildExplanation(
+        sourceText,
         decision.statement,
         identity.stage,
         decision.isRumour,
       );
-      const composed = body ? composePost(decision.statement, body, sourceName) : null;
+      const needsDetail =
+        !firstAttempt ||
+        countWordsOf(firstAttempt) < 30 ||
+        /(?:\.\.\.|\u2026|…)$/.test((article.description ?? "").trim());
+
+      if (needsDetail && article.articleUrl && articleBudgetRemaining() > 0) {
+        const content = await fetchArticleContent(article.articleUrl);
+        if (content.text) {
+          // Prefer the fuller article text, but keep the summary too: the
+          // lead paragraph often reads better than extracted markup.
+          sourceText = `${article.description ?? ""}\n\n${content.text}`;
+          firstAttempt = buildExplanation(
+            sourceText,
+            decision.statement,
+            identity.stage,
+            decision.isRumour,
+          );
+        }
+      }
+
+      const composed = firstAttempt
+        ? composePost(decision.statement, firstAttempt, sourceName)
+        : null;
+
+      // Final editorial gate before this story can ever be queued.
       if (composed) {
-        postText = composed.message;
-        headline = composed.headline;
-        explanation = composed.explanation;
+        const quality = finalQualityCheck(composed, { sourceText, headline: decision.statement });
+        if (quality.ok) {
+          postText = composed.message;
+          headline = composed.headline;
+          explanation = composed.explanation;
+        } else {
+          status = "rejected";
+          reason = `quality gate: ${quality.problems[0] ?? "post did not pass the final check"}`;
+        }
       } else {
         status = "rejected";
         reason = "no accurate, useful explanation could be produced from the source report";
@@ -700,7 +776,8 @@ async function ingestNormalized(
         relevance_score, is_rumour, post_text, status, decision_reason,
         provider, feed_name,
         story_fingerprint, story_stage, story_stage_rank, is_followup,
-        duplicate_kind, reject_kind, headline, explanation, age_minutes_at_discovery
+        duplicate_kind, reject_kind, headline, explanation, age_minutes_at_discovery,
+        freshness_category, requires_corroboration, last_seen_at
       )
       VALUES (
         ${article.articleId}, ${article.title}, ${JSON.stringify(decision.titleTokens)}::jsonb,
@@ -710,7 +787,8 @@ async function ingestNormalized(
         ${provider}, ${feedName},
         ${fingerprint}, ${identity.stage}, ${identity.stageRank}, ${isFollowUp},
         ${duplicateKind}, ${decision.rejectKind}, ${headline}, ${explanation},
-        ${freshness.ageMinutes}
+        ${freshness.ageMinutes}, ${freshness.category}, ${freshness.requiresCorroboration},
+        now()
       )
       ON CONFLICT (dedupe_key) DO NOTHING
       RETURNING id
@@ -724,6 +802,9 @@ async function ingestNormalized(
 
     // Track the story itself (identity, not publication state).
     await upsertStory(fingerprint, identity.entities, identity.eventKind, decision.titleTokens, article.title);
+    // Record this publisher against the story so corroboration counts
+    // DISTINCT publishers rather than article copies.
+    await recordStorySource(fingerprint, sourceName);
 
     if (status === "candidate") {
       counters.newCandidates += 1;
@@ -756,6 +837,50 @@ async function ingestNormalized(
   }
 
   return counters;
+}
+
+/** Counts DISTINCT credible publishers reporting this story (including this one). */
+async function countDistinctPublishers(fingerprint: string, sourceName: string | null): Promise<number> {
+  if (!sourceName) return 1;
+  try {
+    const sql = getDb();
+    await recordStorySource(fingerprint, sourceName);
+    const rows = (await sql`
+      SELECT count(*)::int AS n FROM story_sources WHERE fingerprint = ${fingerprint}
+    `) as { n: number }[];
+    return Math.max(1, rows[0]?.n ?? 1);
+  } catch {
+    return 1;
+  }
+}
+
+/** Records a (story, publisher) pair. The primary key makes it distinct. */
+async function recordStorySource(fingerprint: string, publisher: string | null): Promise<void> {
+  if (!publisher) return;
+  try {
+    const sql = getDb();
+    await sql`
+      INSERT INTO story_sources (fingerprint, publisher)
+      VALUES (${fingerprint}, ${publisher})
+      ON CONFLICT (fingerprint, publisher) DO UPDATE
+        SET last_seen_at = now()
+    `;
+  } catch {
+    // Corroboration bookkeeping must never break ingestion.
+  }
+}
+
+/** True when this story has already been published by DynaSport. */
+async function storyAlreadyPublished(fingerprint: string): Promise<boolean> {
+  try {
+    const sql = getDb();
+    const rows = (await sql`
+      SELECT published_count FROM stories WHERE fingerprint = ${fingerprint}
+    `) as { published_count: number }[];
+    return (rows[0]?.published_count ?? 0) > 0;
+  } catch {
+    return false;
+  }
 }
 
 async function upsertStory(
@@ -841,6 +966,11 @@ function finalize(summary: AutomationSummary, startedAt: Date): void {
   const finishedAt = new Date();
   summary.finishedAt = finishedAt.toISOString();
   summary.durationMs = finishedAt.getTime() - startedAt.getTime();
+}
+
+function countWordsOf(text: string | null): number {
+  if (!text) return 0;
+  return text.trim().split(/\s+/).filter(Boolean).length;
 }
 
 function errorMessage(error: unknown): string {

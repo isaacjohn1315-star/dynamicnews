@@ -1,5 +1,4 @@
 import { neon } from "@neondatabase/serverless";
-import { Pool } from "pg";
 
 /**
  * DynaSport database layer — one Postgres database, no ORM, one SQL surface.
@@ -30,11 +29,22 @@ function isNeonUrl(url: string): boolean {
   }
 }
 
-let cachedPool: Pool | null = null;
+/**
+ * node-postgres is imported lazily and only when the URL is not a Neon
+ * endpoint. On Vercel (Neon) the module is therefore never bundled into the
+ * serverless function, which avoids the known pg/pg-cloudflare bundling
+ * issues and keeps the production path on the Neon HTTPS driver alone.
+ */
+type PgPoolLike = {
+  query(args: { text: string; values: unknown[] }): Promise<{ rows: unknown[] }>;
+};
 
-function getLocalPool(connectionString: string): Pool {
+let cachedPool: PgPoolLike | null = null;
+
+async function getLocalPool(connectionString: string): Promise<PgPoolLike> {
   if (!cachedPool) {
-    cachedPool = new Pool({ connectionString, max: 5, idleTimeoutMillis: 10_000 });
+    const { Pool } = (await import("pg")) as typeof import("pg");
+    cachedPool = new Pool({ connectionString, max: 5, idleTimeoutMillis: 10_000 }) as unknown as PgPoolLike;
   }
   return cachedPool;
 }
@@ -44,7 +54,7 @@ function getLocalPool(connectionString: string): Pool {
  * driver exposes, so every query in the application works unchanged on
  * either transport.
  */
-function pgTagged(pool: Pool): SqlClient {
+function pgTagged(pool: PgPoolLike): SqlClient {
   return async (strings, ...values) => {
     let text = strings[0];
     for (let i = 1; i < strings.length; i += 1) {
@@ -68,7 +78,14 @@ export function getDb(): SqlClient {
   }
 
   // Non-Neon URL (local development / debugging): same SQL over TCP.
-  return pgTagged(getLocalPool(databaseUrl));
+  // Returned asynchronously so the pg module stays out of the Neon path.
+  let cache: SqlClient | null = null;
+  return async (strings, ...values) => {
+    if (!cache) {
+      cache = pgTagged(await getLocalPool(databaseUrl));
+    }
+    return cache(strings, ...values);
+  };
 }
 
 /** Reports which transport is active, for the dashboard and health check. */
@@ -306,6 +323,75 @@ async function createSchema(): Promise<void> {
   await sql`ALTER TABLE rss_feeds ALTER COLUMN last_status SET DEFAULT 'untested'`;
   await sql`UPDATE rss_feeds SET last_status = 'untested' WHERE last_status IS NULL`;
 
+  /* -------------------------------------------------------------- */
+  /* Feed registry at scale (target capacity: 50,000 feeds)          */
+  /* -------------------------------------------------------------- */
+
+  // Additive only: existing feed rows keep their data and status.
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS normalized_url text`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS domain text`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS category text`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS priority smallint NOT NULL DEFAULT 2`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS paused boolean NOT NULL DEFAULT false`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS last_http_status integer`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS next_check_at timestamptz`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS poll_interval_minutes integer NOT NULL DEFAULT 60`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS claimed_at timestamptz`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS claimed_by uuid`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS fetch_ms integer`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS useful_items integer NOT NULL DEFAULT 0`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS total_checks integer NOT NULL DEFAULT 0`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS total_failures integer NOT NULL DEFAULT 0`;
+  await sql`ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS rate_limited_until timestamptz`;
+
+  // Backfill derived columns for pre-existing rows (bounded, idempotent).
+  await sql`
+    UPDATE rss_feeds
+    SET normalized_url = COALESCE(normalized_url, lower(url)),
+        domain = COALESCE(
+          domain,
+          lower(split_part(split_part(regexp_replace(url, '^https?://', ''), '/', 1), ':', 1))
+        ),
+        next_check_at = COALESCE(next_check_at, now())
+    WHERE normalized_url IS NULL OR domain IS NULL OR next_check_at IS NULL
+  `;
+
+  // Scheduler index: the claim query orders by due time among eligible feeds.
+  await sql`
+    CREATE INDEX IF NOT EXISTS rss_feeds_due_idx
+      ON rss_feeds (next_check_at ASC NULLS FIRST)
+      WHERE enabled = true AND paused = false
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS rss_feeds_domain_idx ON rss_feeds (domain)`;
+  await sql`CREATE INDEX IF NOT EXISTS rss_feeds_status_idx ON rss_feeds (last_status)`;
+  await sql`CREATE INDEX IF NOT EXISTS rss_feeds_priority_idx ON rss_feeds (priority, next_check_at)`;
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS rss_feeds_normalized_url_key
+      ON rss_feeds (normalized_url)
+      WHERE normalized_url IS NOT NULL
+  `;
+
+  // Durable batch progress so an interrupted run resumes instead of restarting.
+  await sql`
+    CREATE TABLE IF NOT EXISTS feed_batches (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      started_at timestamptz NOT NULL DEFAULT now(),
+      finished_at timestamptz,
+      status text NOT NULL DEFAULT 'running',
+      claimed integer NOT NULL DEFAULT 0,
+      processed integer NOT NULL DEFAULT 0,
+      ok integer NOT NULL DEFAULT 0,
+      failed integer NOT NULL DEFAULT 0,
+      not_modified integer NOT NULL DEFAULT 0,
+      articles integer NOT NULL DEFAULT 0,
+      avg_fetch_ms integer,
+      rate_limited integer NOT NULL DEFAULT 0
+    )
+  `;
+  await sql`
+    CREATE INDEX IF NOT EXISTS feed_batches_started_idx ON feed_batches (started_at DESC)
+  `;
+
   await sql`
     CREATE INDEX IF NOT EXISTS rss_feeds_rotation_idx
       ON rss_feeds (last_fetched_at ASC NULLS FIRST)
@@ -315,6 +401,45 @@ async function createSchema(): Promise<void> {
   // Article freshness: when DynaSport first saw an item, and whether it was
   // new at the moment of discovery.
   await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS first_seen_at timestamptz NOT NULL DEFAULT now()`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS last_seen_at timestamptz NOT NULL DEFAULT now()`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS freshness_category text`;
+  await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS requires_corroboration boolean NOT NULL DEFAULT false`;
+
+  // Article-content cache: prevents re-downloading the same article page
+  // within a day, which is both polite to publishers and fast.
+  await sql`
+    CREATE TABLE IF NOT EXISTS article_cache (
+      url text PRIMARY KEY,
+      content text NOT NULL,
+      fetched_at timestamptz NOT NULL DEFAULT now()
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS article_cache_fetched_idx ON article_cache (fetched_at DESC)`;
+
+  // STRICT duplicate protection: the final Facebook message text can never
+  // be published twice, whatever path produced it.
+  await sql`
+    CREATE TABLE IF NOT EXISTS published_posts (
+      post_hash text PRIMARY KEY,
+      news_item_id uuid,
+      fb_post_id text,
+      published_at timestamptz NOT NULL DEFAULT now()
+    )
+  `;
+
+  // Distinct publishers per story: the PRIMARY KEY guarantees one row per
+  // (story, publisher), so one outlet republishing five near-copies counts
+  // as breadth of one, not five. This is the only corroboration evidence
+  // DynaSport uses — it never fabricates engagement or popularity numbers.
+  await sql`
+    CREATE TABLE IF NOT EXISTS story_sources (
+      fingerprint text NOT NULL,
+      publisher text NOT NULL,
+      first_seen_at timestamptz NOT NULL DEFAULT now(),
+      last_seen_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (fingerprint, publisher)
+    )
+  `;
   await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS headline text`;
   await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS explanation text`;
   await sql`ALTER TABLE news_items ADD COLUMN IF NOT EXISTS age_minutes_at_discovery integer`;
@@ -446,11 +571,41 @@ export interface StoryRow {
   updated_at: string;
 }
 
+export interface FeedBatchRow {
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  claimed: number;
+  processed: number;
+  ok: number;
+  failed: number;
+  not_modified: number;
+  articles: number;
+  avg_fetch_ms: number | null;
+  rate_limited: number;
+}
+
 export interface RssFeedRow {
   id: string;
   name: string;
   topic: string | null;
   url: string;
+  normalized_url: string | null;
+  domain: string | null;
+  category: string | null;
+  priority: number;
+  paused: boolean;
+  last_http_status: number | null;
+  next_check_at: string | null;
+  poll_interval_minutes: number;
+  claimed_at: string | null;
+  claimed_by: string | null;
+  fetch_ms: number | null;
+  useful_items: number;
+  total_checks: number;
+  total_failures: number;
+  rate_limited_until: string | null;
   enabled: boolean;
   etag: string | null;
   last_modified: string | null;

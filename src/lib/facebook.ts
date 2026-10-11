@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { getDb } from "./db";
 import { facebookAppCredentials, facebookPageAccessToken, facebookPageId } from "./env";
 
 /**
@@ -25,7 +27,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
  *
  * No article links. No hashtags. Exactly one blank line between each part.
  */
-const POST_PATTERN = /^🚩 [^\n]{15,}\n\n[^\n]{25,}\n\nSource: [^\n]{1,80}$/;
+/** The explanation can be several sentences, so it spans multiple lines. */
+const POST_PATTERN = /^🚩 [^\n]{15,}\n\n[\s\S]{25,2000}\n\nSource: [^\n]{1,80}$/;
 const FORBIDDEN_IN_POST = /(https?:\/\/|www\.|#\w)/i;
 /** Raw markup or escaped character codes must never reach Facebook. */
 const RESIDUAL_MARKUP = /<[a-zA-Z/][^>]*>|&[a-zA-Z]{2,8};|&#\d{2,6};?/;
@@ -48,11 +51,17 @@ export function isValidPostText(text: string): boolean {
   if (RESIDUAL_MARKUP.test(text)) return false;
 
   const parts = text.split("\n");
-  if (parts.length !== 5) return false;
-  if (parts[1] !== "" || parts[3] !== "") return false;
+  // headline, blank, body (>=1 line), blank, source
+  if (parts.length < 5) return false;
+  if (parts[1] !== "" || parts[parts.length - 2] !== "") return false;
   if (!parts[0].startsWith("🚩 ")) return false;
-  if (!parts[2] || parts[2].trim().length < 25) return false;
-  if (!parts[4].startsWith("Source: ") || parts[4].length <= "Source: ".length) return false;
+  const body = parts.slice(2, parts.length - 2).join(" ").trim();
+  if (body.length < 25) return false;
+  // No unfinished sentences and no ellipsis hiding missing information.
+  if (/\.{3}|\u2026|…/.test(body)) return false;
+  if (!/[.!?]$/.test(body)) return false;
+  const source = parts[parts.length - 1];
+  if (!source.startsWith("Source: ") || source.length <= "Source: ".length) return false;
   return true;
 }
 
@@ -81,6 +90,20 @@ export class FacebookPublishError extends Error {
 export async function publishToFacebook(message: string): Promise<{ id: string }> {
   if (!isValidPostText(message)) {
     throw new FacebookPublishError("Post text failed DynaSport format validation");
+  }
+
+  // STRICT duplicate protection at the last possible moment: the exact
+  // message text can never be published twice, regardless of which
+  // discovery path produced it.
+  const hash = createHash("sha256").update(message, "utf8").digest("hex");
+  const sql = getDb();
+  const claimed = (await sql`
+    INSERT INTO published_posts (post_hash) VALUES (${hash})
+    ON CONFLICT (post_hash) DO NOTHING
+    RETURNING post_hash
+  `) as { post_hash: string }[];
+  if (claimed.length === 0) {
+    throw new FacebookPublishError("This exact post has already been published", null, false);
   }
 
   const pageId = facebookPageId();

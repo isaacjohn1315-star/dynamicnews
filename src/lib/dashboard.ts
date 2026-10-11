@@ -3,6 +3,7 @@ import { getBudgetStats } from "./request-budget";
 import { getPublishState, type PublishState } from "./publishing";
 import { getScanState } from "./freshness";
 import { FEED_COUNT } from "./feeds";
+import { getRegistryStats, type RegistryStats } from "./feed-registry";
 
 /**
  * Read-only aggregation for the production monitoring dashboard.
@@ -51,6 +52,8 @@ export interface DashboardStory {
   headline: string | null;
   explanation: string | null;
   ageMinutesAtDiscovery: number | null;
+  firstSeenAt: string | null;
+  freshnessCategory: string | null;
   isFollowup: boolean;
   duplicateKind: string | null;
   rejectKind: string | null;
@@ -77,6 +80,12 @@ export interface DashboardFeed {
   lastError: string | null;
   consecutiveFailures: number;
   itemsSeen: number;
+  paused: boolean;
+  priority: number;
+  nextCheckAt: string | null;
+  pollIntervalMinutes: number;
+  lastHttpStatus: number | null;
+  fetchMs: number | null;
 }
 
 export interface DashboardData {
@@ -89,8 +98,16 @@ export interface DashboardData {
     failing: number;
     untested: number;
     backoff: number;
-    /** Feeds shown in the list — the catalogue is too long to render fully. */
+    /** Feeds shown in the list — the registry is too long to render fully. */
     shown: number;
+  };
+  registry: RegistryStats;
+  batches: {
+    lastFinishedAt: string | null;
+    lastProcessed: number;
+    lastArticles: number;
+    lastAvgFetchMs: number | null;
+    running: number;
   };
   budget: {
     day: string;
@@ -116,6 +133,7 @@ export interface DashboardData {
     exactDuplicates: number;
     storyDuplicates: number;
     followups: number;
+    trending: number;
     failed: number;
     awaitingRetry: number;
     runsToday: number;
@@ -154,6 +172,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         COUNT(*) FILTER (WHERE status = 'duplicate' AND duplicate_kind IS DISTINCT FROM 'story')::int AS exact_duplicates,
         COUNT(*) FILTER (WHERE status = 'duplicate' AND duplicate_kind = 'story')::int AS story_duplicates,
         COUNT(*) FILTER (WHERE is_followup = true AND status = 'published')::int AS followups,
+        COUNT(*) FILTER (WHERE freshness_category = 'trending')::int AS trending,
         COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
         COUNT(*) FILTER (WHERE status = 'candidate' AND attempts > 0)::int AS awaiting_retry
       FROM news_items
@@ -167,6 +186,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       exact_duplicates: number;
       story_duplicates: number;
       followups: number;
+      trending: number;
       failed: number;
       awaiting_retry: number;
     }[];
@@ -207,7 +227,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       SELECT id, title, source_name, provider, feed_name, status, relevance_score,
              corroborations, is_rumour, story_stage, is_followup, duplicate_kind,
              reject_kind, decision_reason, attempts, last_error, headline, explanation,
-             age_minutes_at_discovery, next_retry_at, created_at, published_at, posted_at, fb_post_id
+             age_minutes_at_discovery, freshness_category, next_retry_at, created_at,
+             published_at, first_seen_at, posted_at, fb_post_id
       FROM news_items
       ORDER BY created_at DESC
       LIMIT 18
@@ -217,7 +238,8 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       SELECT id, title, source_name, provider, feed_name, status, relevance_score,
              corroborations, is_rumour, story_stage, is_followup, duplicate_kind,
              reject_kind, decision_reason, attempts, last_error, headline, explanation,
-             age_minutes_at_discovery, next_retry_at, created_at, published_at, posted_at, fb_post_id
+             age_minutes_at_discovery, freshness_category, next_retry_at, created_at,
+             published_at, first_seen_at, posted_at, fb_post_id
       FROM news_items
       WHERE status = 'published'
       ORDER BY posted_at DESC NULLS LAST
@@ -225,7 +247,9 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     `) as Record<string, unknown>[];
 
     const feedRows = (await sql`
-      SELECT id, name, topic, url, enabled, last_fetched_at, last_success_at,
+      SELECT id, name, topic, url, enabled, paused, priority, domain,
+             next_check_at, poll_interval_minutes, last_http_status, fetch_ms,
+             last_fetched_at, last_success_at,
              latest_item_at, last_status, last_error, consecutive_failures, items_seen
       FROM rss_feeds
       ORDER BY
@@ -243,6 +267,17 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         count(*) FILTER (WHERE last_status = 'skipped_backoff')::int AS backoff
       FROM rss_feeds
     `) as { total: number; healthy: number; failing: number; untested: number; backoff: number }[];
+
+    const registry = await getRegistryStats();
+    const batchRows = (await sql`
+      SELECT started_at, finished_at, status, processed, articles, avg_fetch_ms
+      FROM feed_batches ORDER BY started_at DESC LIMIT 5
+    `) as Record<string, unknown>[];
+    const runningRows = (await sql`
+      SELECT count(*)::int AS n FROM feed_batches
+      WHERE status = 'running' AND started_at > now() - interval '10 minutes'
+    `) as { n: number }[];
+    const lastDone = batchRows.find((b) => b.finished_at !== null);
 
     const publish = await getPublishState();
     const scan = await getScanState();
@@ -269,6 +304,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       exact_duplicates: 0,
       story_duplicates: 0,
       followups: 0,
+      trending: 0,
       failed: 0,
       awaiting_retry: 0,
     };
@@ -303,6 +339,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         exactDuplicates: totals.exact_duplicates,
         storyDuplicates: totals.story_duplicates,
         followups: totals.followups,
+        trending: totals.trending,
         failed: totals.failed,
         awaitingRetry: totals.awaiting_retry,
         runsToday: runCountsRows[0]?.runs_today ?? 0,
@@ -317,6 +354,15 @@ export async function getDashboardData(): Promise<DashboardData | null> {
         untested: feedStatsRows[0]?.untested ?? 0,
         backoff: feedStatsRows[0]?.backoff ?? 0,
         shown: Math.min(feedRows.length, 60),
+      },
+      registry,
+      batches: {
+        lastFinishedAt: isoStringOrNull(lastDone?.finished_at),
+        lastProcessed: toNumber(lastDone?.processed),
+        lastArticles: toNumber(lastDone?.articles),
+        lastAvgFetchMs: lastDone?.avg_fetch_ms === null || lastDone?.avg_fetch_ms === undefined
+          ? null : toNumber(lastDone.avg_fetch_ms),
+        running: runningRows[0]?.n ?? 0,
       },
       lastRun: recentRuns[0] ?? null,
       lastSuccessfulRun: lastSuccessRows[0] ? toRun(lastSuccessRows[0]) : null,
@@ -375,6 +421,9 @@ function toStory(row: Record<string, unknown>): DashboardStory {
     headline: stringOrNull(row.headline),
     explanation: stringOrNull(row.explanation),
     ageMinutesAtDiscovery: row.age_minutes_at_discovery === null ? null : toNumber(row.age_minutes_at_discovery),
+    publishedAt: isoStringOrNull(row.published_at),
+    firstSeenAt: isoStringOrNull(row.first_seen_at),
+    freshnessCategory: stringOrNull(row.freshness_category),
     isFollowup: row.is_followup === true,
     duplicateKind: stringOrNull(row.duplicate_kind),
     rejectKind: stringOrNull(row.reject_kind),
@@ -383,7 +432,6 @@ function toStory(row: Record<string, unknown>): DashboardStory {
     lastError: stringOrNull(row.last_error),
     nextRetryAt: isoStringOrNull(row.next_retry_at),
     createdAt: isoString(row.created_at),
-    publishedAt: isoStringOrNull(row.published_at),
     postedAt: isoStringOrNull(row.posted_at),
     fbPostId: stringOrNull(row.fb_post_id),
   };
@@ -403,6 +451,12 @@ function toFeed(row: Record<string, unknown>): DashboardFeed {
     lastError: stringOrNull(row.last_error),
     consecutiveFailures: toNumber(row.consecutive_failures),
     itemsSeen: toNumber(row.items_seen),
+    paused: row.paused === true,
+    priority: toNumber(row.priority),
+    nextCheckAt: isoStringOrNull(row.next_check_at),
+    pollIntervalMinutes: toNumber(row.poll_interval_minutes),
+    lastHttpStatus: row.last_http_status === null ? null : toNumber(row.last_http_status),
+    fetchMs: row.fetch_ms === null ? null : toNumber(row.fetch_ms),
   };
 }
 

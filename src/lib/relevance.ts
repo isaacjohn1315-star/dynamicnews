@@ -316,7 +316,6 @@ const STOPWORDS = new Set([
 /* ------------------------------------------------------------------ */
 
 export const RELEVANCE_THRESHOLD = 50;
-export const MAX_ARTICLE_AGE_HOURS = 48;
 export const STORY_DUP_MIN_SHARED = 4;
 export const STORY_DUP_MIN_CONTAINMENT = 0.6;
 
@@ -434,19 +433,27 @@ export function evaluateArticle(
   }
 
   // --- Freshness ------------------------------------------------------
+  // Age is NOT a rejection criterion here. A blanket 48-hour cut-off used to
+  // discard important stories that stay relevant for days; freshness is now
+  // classified in lib/freshness.ts, where a corroborated 2-7 day old story
+  // can qualify as trending. Only a timestamp in the future (a feed error)
+  // is rejected outright.
   let ageHours: number | null = null;
   if (article.publishedAt) {
     ageHours = (now.getTime() - article.publishedAt.getTime()) / 3_600_000;
-    if (ageHours > MAX_ARTICLE_AGE_HOURS) {
-      return reject("stale article (older than 48 hours)", 0, "stale");
-    }
     if (ageHours < -6) {
       return reject("publication date is implausibly far in the future");
     }
   }
+  const hasTrustworthyTimestamp = ageHours !== null;
 
   // --- Scoring ---------------------------------------------------------
   let score = SOURCE_SCORE[credibility];
+  if (!hasTrustworthyTimestamp) {
+    // No trustworthy timestamp: still scored for monitoring, but the story
+    // can never be published automatically on an unverifiable date.
+    score -= 10;
+  }
 
   if (ageHours === null) {
     score += 8;
